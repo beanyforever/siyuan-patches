@@ -1,4 +1,4 @@
-From 69a9f63c19686503d0b29592cd48535efbb0fa32 Mon Sep 17 00:00:00 2001
+From 27cd24a27f79434b0894dcd803f6bba87e563995 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 14:30:33 -0400
 Subject: [PATCH] MCP server sends the custom instructions as its instructions
@@ -9,12 +9,12 @@ receiving middleware now puts the file's trimmed content into the initialize and
 server/discover results. It reads the file on every handshake, so an edit applies
 from the next connection, and a missing or blank file still sends no field.
 ---
- kernel/mcp/server.go      | 32 ++++++++++++++++++++++-
+ kernel/mcp/server.go      | 33 ++++++++++++++++++++++-
  kernel/mcp/server_test.go | 55 +++++++++++++++++++++++++++++++++++++++
- 2 files changed, 86 insertions(+), 1 deletion(-)
+ 2 files changed, 87 insertions(+), 1 deletion(-)
 
 diff --git a/kernel/mcp/server.go b/kernel/mcp/server.go
-index 0524855..cf4c027 100644
+index 0524855..9270ecc 100644
 --- a/kernel/mcp/server.go
 +++ b/kernel/mcp/server.go
 @@ -22,6 +22,7 @@ import (
@@ -25,7 +25,7 @@ index 0524855..cf4c027 100644
  	"sync"
  
  	"github.com/gin-gonic/gin"
-@@ -156,10 +157,39 @@ func newServer() *mcpsdk.Server {
+@@ -156,10 +157,40 @@ func newServer() *mcpsdk.Server {
  	}, &mcpsdk.ServerOptions{
  		Capabilities: &mcpsdk.ServerCapabilities{},
  	})
@@ -34,8 +34,9 @@ index 0524855..cf4c027 100644
  	return server
  }
  
-+// customInstructionsMiddleware 把设置中的自定义指令（data/ai/AGENTS.md）作为服务器说明发给 MCP 客户端。
-+// 每次握手都重新读取，修改从下一次连接起生效；内容为空时不发送该字段。
++// customInstructionsMiddleware sends Settings > AI > Agent > Custom instructions (data/ai/AGENTS.md)
++// to MCP clients as the server's instructions. It reads the file on every handshake, so an edit
++// applies from the next connection, and a blank file sends no instructions field.
 +func customInstructionsMiddleware() mcpsdk.Middleware {
 +	return func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
 +		return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {

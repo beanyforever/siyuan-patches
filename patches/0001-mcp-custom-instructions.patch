@@ -1,0 +1,137 @@
+From 69a9f63c19686503d0b29592cd48535efbb0fa32 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:30:33 -0400
+Subject: [PATCH] MCP server sends the custom instructions as its instructions
+
+Settings > AI > Agent > Custom instructions (data/ai/AGENTS.md) reached only the
+built-in Agent, so an MCP client such as Claude got no instructions at all. A
+receiving middleware now puts the file's trimmed content into the initialize and
+server/discover results. It reads the file on every handshake, so an edit applies
+from the next connection, and a missing or blank file still sends no field.
+---
+ kernel/mcp/server.go      | 32 ++++++++++++++++++++++-
+ kernel/mcp/server_test.go | 55 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/mcp/server.go b/kernel/mcp/server.go
+index 0524855..cf4c027 100644
+--- a/kernel/mcp/server.go
++++ b/kernel/mcp/server.go
+@@ -22,6 +22,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"strings"
+ 	"sync"
+ 
+ 	"github.com/gin-gonic/gin"
+@@ -156,10 +157,39 @@ func newServer() *mcpsdk.Server {
+ 	}, &mcpsdk.ServerOptions{
+ 		Capabilities: &mcpsdk.ServerCapabilities{},
+ 	})
+-	server.AddReceivingMiddleware(privateCacheMiddleware())
++	server.AddReceivingMiddleware(privateCacheMiddleware(), customInstructionsMiddleware())
+ 	return server
+ }
+ 
++// customInstructionsMiddleware 把设置中的自定义指令（data/ai/AGENTS.md）作为服务器说明发给 MCP 客户端。
++// 每次握手都重新读取，修改从下一次连接起生效；内容为空时不发送该字段。
++func customInstructionsMiddleware() mcpsdk.Middleware {
++	return func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
++		return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {
++			result, err := next(ctx, method, request)
++			if err != nil {
++				return result, err
++			}
++			switch handshake := result.(type) {
++			case *mcpsdk.InitializeResult:
++				handshake.Instructions = customInstructions()
++			case *mcpsdk.DiscoverResult:
++				handshake.Instructions = customInstructions()
++			}
++			return result, err
++		}
++	}
++}
++
++func customInstructions() string {
++	instructions, err := util.ReadAgentInstructions()
++	if err != nil {
++		logging.LogWarnf("mcp: read agent instructions failed: %v", err)
++		return ""
++	}
++	return strings.TrimSpace(instructions.Content)
++}
++
+ func privateCacheMiddleware() mcpsdk.Middleware {
+ 	return func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
+ 		return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {
+diff --git a/kernel/mcp/server_test.go b/kernel/mcp/server_test.go
+index f40f85c..2eb3232 100644
+--- a/kernel/mcp/server_test.go
++++ b/kernel/mcp/server_test.go
+@@ -624,6 +624,61 @@ func TestLegacyProtocolSession(t *testing.T) {
+ 	}
+ }
+ 
++func TestCustomInstructionsAreSentAsServerInstructions(t *testing.T) {
++	originalDataDir := util.DataDir
++	util.DataDir = t.TempDir()
++	t.Cleanup(func() { util.DataDir = originalDataDir })
++	_, httpServer := newTestHTTPServer(t)
++
++	legacyInstructions := func() (string, bool) {
++		initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"legacy","version":"1.0.0"}}}`
++		response := postMCP(t, httpServer.URL, initialize, nil)
++		var initializeResponse struct {
++			Result map[string]any `json:"result"`
++		}
++		decodeResponse(t, response, &initializeResponse)
++		instructions, present := initializeResponse.Result["instructions"].(string)
++		return instructions, present
++	}
++	modernInstructions := func() string {
++		client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "test-client", Version: "1.0.0"}, nil)
++		session, err := client.Connect(t.Context(), &mcpsdk.StreamableClientTransport{Endpoint: httpServer.URL}, nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer session.Close()
++		return session.InitializeResult().Instructions
++	}
++
++	if instructions, present := legacyInstructions(); present {
++		t.Fatalf("instructions sent without AGENTS.md: %q", instructions)
++	}
++	if instructions := modernInstructions(); instructions != "" {
++		t.Fatalf("instructions discovered without AGENTS.md: %q", instructions)
++	}
++
++	if _, err := util.SaveAgentInstructions("Write Tasks in the Tasks database.\n", "missing"); err != nil {
++		t.Fatal(err)
++	}
++	if instructions, _ := legacyInstructions(); instructions != "Write Tasks in the Tasks database." {
++		t.Fatalf("unexpected legacy instructions: %q", instructions)
++	}
++	if instructions := modernInstructions(); instructions != "Write Tasks in the Tasks database." {
++		t.Fatalf("unexpected modern instructions: %q", instructions)
++	}
++
++	current, err := util.ReadAgentInstructions()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err = util.SaveAgentInstructions("  \n", current.Revision); err != nil {
++		t.Fatal(err)
++	}
++	if instructions, present := legacyInstructions(); present {
++		t.Fatalf("blank AGENTS.md sent as instructions: %q", instructions)
++	}
++}
++
+ func TestLegacyInitializeDoesNotNegotiateModernProtocol(t *testing.T) {
+ 	_, httpServer := newTestHTTPServer(t)
+ 	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"legacy","version":"1.0.0"}}}`
+-- 
+2.53.0
+

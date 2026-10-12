@@ -1,0 +1,1265 @@
+From 1933fd1e80e044602a5056c9bfa89a3836b75b91 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 17:23:05 -0400
+Subject: [PATCH] Databases refuse edits that destroy property values
+
+A property is a database field whose description starts with "key: <key>",
+which says what the field means whatever its name. Some edits to one destroy the
+values its rows hold, and SiYuan made them in the editor, over /api/av/* and
+through the MCP database tool without a word. They are now refused before
+anything changes: deleting a property, or a field whose two-way partner is a
+property when the partner goes with it; changing a property's format; removing
+or changing the key in its description, or the Type mark "(type: ...)" on a
+primary field's; changing what a relation property links to, or whether and
+with which field it is two-way, once it has a target; and removing or renaming
+an option that rows of the database still use, on any property. Deleting a page
+through a block deletion was refused only by /api/block/deleteBlock; it is now
+refused on every way in, with a message saying to delete it from the tree.
+
+Everything else passes: renaming a property, adding, reordering and recolouring
+options, removing or renaming an unused one, display formats, adding a key or a
+Type mark, a relation's first target, and any edit to a field without a key. A
+keyed field holding no values while another field carries the same key is a
+copy, as "Duplicate" makes, so undoing the duplicate still works. The editor
+undoes "add option" by removing the option, which also clears the rows the same
+edit picked it on, so an undo may clear those rows, though no others.
+
+The checks sit in the shared functions every way in reaches, and the
+transaction path also checks a whole transaction before applying any of it.
+Over the API, MCP and the CLI the reason is the error. In the editor a refusal
+reloads every open window, which already shows the edit, and each window is
+told the reason once it has connected again.
+---
+ kernel/model/attribute_view.go                |  30 +-
+ kernel/model/attribute_view_fields.go         |   9 +
+ kernel/model/attribute_view_option_undo.go    |   3 +
+ kernel/model/attribute_view_property_guard.go | 447 +++++++++++++++
+ .../attribute_view_property_guard_test.go     | 508 ++++++++++++++++++
+ kernel/model/block_operation.go               |   2 +-
+ kernel/model/transaction.go                   |  11 +
+ kernel/util/websocket.go                      |  53 ++
+ 8 files changed, 1056 insertions(+), 7 deletions(-)
+ create mode 100644 kernel/model/attribute_view_property_guard.go
+ create mode 100644 kernel/model/attribute_view_property_guard_test.go
+
+diff --git a/kernel/model/attribute_view.go b/kernel/model/attribute_view.go
+index 6940429..570b5b1 100644
+--- a/kernel/model/attribute_view.go
++++ b/kernel/model/attribute_view.go
+@@ -4519,7 +4519,7 @@ func updateAttributeViewColRollup(operation *Operation) (err error) {
+ func (tx *Transaction) doUpdateAttrViewColRelation(operation *Operation) (ret *TxErr) {
+ 	err := updateAttributeViewColRelation(operation)
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+@@ -4547,6 +4547,18 @@ func updateAttributeViewColRelation(operation *Operation) (err error) {
+ 	if isSameAv {
+ 		destAv = srcAv
+ 	}
++	if err = checkAttributeViewRelationChange(srcAv, operation, func(id string) *av.AttributeView {
++		switch id {
++		case srcAv.ID:
++			return srcAv
++		case destAv.ID:
++			return destAv
++		}
++		ret, _ := av.ParseAttributeView(id)
++		return ret
++	}); err != nil {
++		return
++	}
+ 
+ 	oldDestAvID := ""
+ 	for _, keyValues := range srcAv.KeyValues {
+@@ -7063,7 +7075,7 @@ func setAttributeViewColIcon(operation *Operation) (err error) {
+ func (tx *Transaction) doSetAttrViewColumnDesc(operation *Operation) (ret *TxErr) {
+ 	err := setAttributeViewColDesc(operation)
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+@@ -7076,6 +7088,9 @@ func setAttributeViewColDesc(operation *Operation) (err error) {
+ 
+ 	for _, keyValues := range attrView.KeyValues {
+ 		if keyValues.Key.ID == operation.ID {
++			if err = checkAttributeViewFieldDesc(attrView, keyValues.Key, operation.Data.(string)); err != nil {
++				return
++			}
+ 			keyValues.Key.Desc = operation.Data.(string)
+ 			break
+ 		}
+@@ -7674,7 +7689,7 @@ func setAttributeViewColDateFormat(operation *Operation) (err error) {
+ func (tx *Transaction) doUpdateAttrViewColumn(operation *Operation) (ret *TxErr) {
+ 	err := updateAttributeViewColumn(operation)
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+@@ -7702,6 +7717,9 @@ func updateAttributeViewColumn(operation *Operation) (err error) {
+ 					}
+ 					return
+ 				}
++				if err = checkAttributeViewFieldFormat(attrView, keyValues.Key, colType); err != nil {
++					return
++				}
+ 
+ 				keyValues.Key.Name = strings.TrimSpace(operation.Name)
+ 
+@@ -7772,7 +7790,7 @@ func (tx *Transaction) doRemoveAttrViewColumn(operation *Operation) (ret *TxErr)
+ 		err = tx.removeAttributeViewField(operation)
+ 	}
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+@@ -8938,7 +8956,7 @@ func setAttrViewCustomColors(operation *Operation) (err error) {
+ func (tx *Transaction) doRemoveAttrViewColOption(operation *Operation) (ret *TxErr) {
+ 	err := tx.mutateAttributeViewOption(operation, true)
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+@@ -8946,7 +8964,7 @@ func (tx *Transaction) doRemoveAttrViewColOption(operation *Operation) (ret *TxE
+ func (tx *Transaction) doUpdateAttrViewColOption(operation *Operation) (ret *TxErr) {
+ 	err := tx.mutateAttributeViewOption(operation, false)
+ 	if err != nil {
+-		return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++		return attributeViewTxErr(operation, err)
+ 	}
+ 	return
+ }
+diff --git a/kernel/model/attribute_view_fields.go b/kernel/model/attribute_view_fields.go
+index 87d3227..cb07cb1 100644
+--- a/kernel/model/attribute_view_fields.go
++++ b/kernel/model/attribute_view_fields.go
+@@ -108,6 +108,15 @@ func (tx *Transaction) removeAttributeViewField(op *Operation) error {
+ 	if key.Type == av.KeyTypeBlock {
+ 		return errors.New("cannot remove primary key field")
+ 	}
++	if err = checkAttributeViewFieldRemoval(source, key, op.RemoveDest, func(id string) *av.AttributeView {
++		if id == source.ID {
++			return source
++		}
++		dest, _ := load(id, true)
++		return dest
++	}); err != nil {
++		return err
++	}
+ 	removals := map[string][]string{source.ID: {key.ID}}
+ 	if relation := key.Relation; key.Type == av.KeyTypeRelation && relation != nil && relation.IsTwoWay && relation.AvID != "" {
+ 		dest, loadErr := load(relation.AvID, true)
+diff --git a/kernel/model/attribute_view_option_undo.go b/kernel/model/attribute_view_option_undo.go
+index 7386b5f..4a4d05e 100644
+--- a/kernel/model/attribute_view_option_undo.go
++++ b/kernel/model/attribute_view_option_undo.go
+@@ -66,6 +66,9 @@ func (tx *Transaction) mutateAttributeViewOption(op *Operation, remove bool) err
+ 	if err != nil {
+ 		return err
+ 	}
++	if err = checkAttributeViewOptionChange(source, key, op, remove, tx.rowsPickedByUndoneEdit(op, remove)); err != nil {
++		return err
++	}
+ 	state.fieldTypes = map[string]map[string]av.KeyType{source.ID: {key.ID: key.Type}}
+ 	before := map[string]*av.AttributeView{}
+ 	views := map[string]*av.AttributeView{source.ID: source}
+diff --git a/kernel/model/attribute_view_property_guard.go b/kernel/model/attribute_view_property_guard.go
+new file mode 100644
+index 0000000..d18c36d
+--- /dev/null
++++ b/kernel/model/attribute_view_property_guard.go
+@@ -0,0 +1,447 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"path"
++	"regexp"
++	"strings"
++
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++)
++
++// Edits that would destroy the values a database property holds are refused before anything
++// changes. A property is a field whose description starts with "key: <key>": the key says what the
++// field means across databases, so views, rules and fixes find the field by it, whatever its name.
++// A field without a key is outside the schema and left alone. The checks run in the shared
++// functions every way in reaches: the editor and /api/transactions through the transaction path,
++// which also checks a whole transaction before applying any of it, and /api/av/*, the MCP
++// database tool and the CLI directly. A refused edit leaves the database as it was and returns the
++// reason as its error.
++
++const attributeViewPropertyKeyPrefix = "key: "
++
++// attributeViewTypeMarkPattern finds the Type mark on a primary field's description, as in
++// "key: name (type: note)": it tells which Type a database holds.
++var attributeViewTypeMarkPattern = regexp.MustCompile(`\(type: [^()]*\)`)
++
++// AttributeViewEditRefusal is an edit refused because it would destroy property values.
++type AttributeViewEditRefusal struct {
++	msg string
++}
++
++func (r *AttributeViewEditRefusal) Error() string {
++	return r.msg
++}
++
++func refuseAttributeViewEdit(format string, args ...any) error {
++	return &AttributeViewEditRefusal{msg: fmt.Sprintf(format, args...)}
++}
++
++// attributeViewTxErr is the transaction error for a failed database operation. A refusal reloads
++// the open windows, which already show the edit, and then tells them why.
++func attributeViewTxErr(operation *Operation, err error) *TxErr {
++	var refusal *AttributeViewEditRefusal
++	if errors.As(err, &refusal) {
++		return &TxErr{code: TxErrCodeRefused, msg: refusal.msg}
++	}
++	return &TxErr{code: TxErrHandleAttributeView, id: operation.AvID, msg: err.Error()}
++}
++
++// attributeViewPropertyKey is the property key a field's description holds, read as the tooling
++// that writes keys reads it: the text after "key: " up to the first space.
++func attributeViewPropertyKey(desc string) string {
++	if !strings.HasPrefix(desc, attributeViewPropertyKeyPrefix) {
++		return ""
++	}
++	key, _, _ := strings.Cut(desc[len(attributeViewPropertyKeyPrefix):], " ")
++	return key
++}
++
++// isAttributeViewProperty reports whether a field is a property. A field that holds no values
++// while another field of the database carries the same key is a copy, such as "Duplicate" makes,
++// and is left alone like a field outside the schema, so undoing the duplicate still works.
++func isAttributeViewProperty(attrView *av.AttributeView, key *av.Key) bool {
++	propertyKey := attributeViewPropertyKey(key.Desc)
++	if "" == propertyKey {
++		return false
++	}
++	for _, kv := range attrView.KeyValues {
++		if kv.Key.ID != key.ID && attributeViewPropertyKey(kv.Key.Desc) == propertyKey {
++			return attributeViewFieldHoldsValues(attrView, key)
++		}
++	}
++	return true
++}
++
++// attributeViewListedItems are the rows a database lists. A value stored for any other item, such
++// as one left by a deleted page, belongs to no row.
++func attributeViewListedItems(attrView *av.AttributeView) map[string]bool {
++	ret := map[string]bool{}
++	if blockValues := attrView.GetBlockKeyValues(); nil != blockValues {
++		for _, value := range blockValues.Values {
++			ret[value.BlockID] = true
++		}
++	}
++	return ret
++}
++
++func attributeViewFieldHoldsValues(attrView *av.AttributeView, key *av.Key) bool {
++	kv, _ := attrView.GetKeyValues(key.ID)
++	if nil == kv {
++		return false
++	}
++	listed := attributeViewListedItems(attrView)
++	for _, value := range kv.Values {
++		if nil == value || !listed[value.BlockID] {
++			continue
++		}
++		switch {
++		case av.KeyTypeRelation == key.Type || av.KeyTypeRelation == value.Type:
++			if nil != value.Relation && 0 < len(value.Relation.BlockIDs) {
++				return true
++			}
++		case av.KeyTypeRollup == key.Type || av.KeyTypeRollup == value.Type:
++			// Computed from other fields, so nothing of its own is lost.
++		case !value.IsEmpty():
++			return true
++		}
++	}
++	return false
++}
++
++// attributeViewOptionUses counts the rows of a database whose field holds the option, leaving out
++// the rows in except.
++func attributeViewOptionUses(attrView *av.AttributeView, keyID, option string, except map[string]bool) (ret int) {
++	kv, _ := attrView.GetKeyValues(keyID)
++	if nil == kv {
++		return
++	}
++	listed := attributeViewListedItems(attrView)
++	for _, value := range kv.Values {
++		if nil == value || !listed[value.BlockID] || except[value.BlockID] {
++			continue
++		}
++		for _, selected := range value.MSelect {
++			if nil != selected && selected.Content == option {
++				ret++
++				break
++			}
++		}
++	}
++	return
++}
++
++func attributeViewFieldLabel(key *av.Key) string {
++	if name := strings.TrimSpace(key.Name); "" != name {
++		return name
++	}
++	return "This field"
++}
++
++func attributeViewLabel(attrView *av.AttributeView) string {
++	if nil != attrView {
++		if name := strings.TrimSpace(attrView.Name); "" != name {
++			return name
++		}
++	}
++	return "another database"
++}
++
++func attributeViewRowsUsing(count int) string {
++	if 1 == count {
++		return "1 row uses it"
++	}
++	return fmt.Sprintf("%d rows use it", count)
++}
++
++// attributeViewLoader reads the databases a check needs besides the one it starts from.
++type attributeViewLoader func(avID string) *av.AttributeView
++
++func parsedAttributeViewLoader(attrView *av.AttributeView) attributeViewLoader {
++	return func(avID string) *av.AttributeView {
++		if avID == attrView.ID {
++			return attrView
++		}
++		ret, _ := av.ParseAttributeView(avID)
++		return ret
++	}
++}
++
++// checkAttributeViewFieldRemoval refuses deleting a property, and deleting a field whose two-way
++// partner is a property when the partner would be deleted with it.
++func checkAttributeViewFieldRemoval(attrView *av.AttributeView, key *av.Key, removeDest bool, load attributeViewLoader) error {
++	if isAttributeViewProperty(attrView, key) {
++		return refuseAttributeViewEdit("%s wasn't deleted: it's a property, and deleting it would empty the %s of every row in %s. Hide it from the view instead.",
++			attributeViewFieldLabel(key), attributeViewFieldLabel(key), attributeViewLabel(attrView))
++	}
++	relation := key.Relation
++	if !removeDest || av.KeyTypeRelation != key.Type || nil == relation || !relation.IsTwoWay || "" == relation.AvID {
++		return nil
++	}
++	dest := load(relation.AvID)
++	if nil == dest {
++		return nil
++	}
++	back, _ := dest.GetKey(relation.BackKeyID)
++	if nil == back || av.KeyTypeRelation != back.Type || nil == back.Relation || back.Relation.AvID != attrView.ID ||
++		!back.Relation.IsTwoWay || back.Relation.BackKeyID != key.ID || !isAttributeViewProperty(dest, back) {
++		return nil
++	}
++	return refuseAttributeViewEdit("%s wasn't deleted: its pair, %s in %s, is a property and would be deleted with it, emptying it on every row. Delete %s alone, keeping %s, or hide it from the view instead.",
++		attributeViewFieldLabel(key), attributeViewFieldLabel(back), attributeViewLabel(dest), attributeViewFieldLabel(key), attributeViewFieldLabel(back))
++}
++
++// checkAttributeViewFieldFormat refuses changing a property's format. A rename passes.
++func checkAttributeViewFieldFormat(attrView *av.AttributeView, key *av.Key, keyType av.KeyType) error {
++	if key.Type == keyType || !isAttributeViewProperty(attrView, key) {
++		return nil
++	}
++	return refuseAttributeViewEdit("%s's format wasn't changed: it's a property, and its values in %s would stop meaning what they mean. Add a new field with that format instead.",
++		attributeViewFieldLabel(key), attributeViewLabel(attrView))
++}
++
++// checkAttributeViewFieldDesc refuses removing or changing a property's key, or the Type mark on
++// a primary field. Adding either to a field without one passes, and so does any other text.
++func checkAttributeViewFieldDesc(attrView *av.AttributeView, key *av.Key, desc string) error {
++	if oldKey := attributeViewPropertyKey(key.Desc); "" != oldKey && attributeViewPropertyKey(desc) != oldKey &&
++		isAttributeViewProperty(attrView, key) {
++		return refuseAttributeViewEdit("%s's description wasn't changed: \"%s%s\" marks it as a property, and every view and rule relies on it. Keep it at the start and put any other text after a space.",
++			attributeViewFieldLabel(key), attributeViewPropertyKeyPrefix, oldKey)
++	}
++	if av.KeyTypeBlock != key.Type {
++		return nil
++	}
++	if oldMark := attributeViewTypeMarkPattern.FindString(key.Desc); "" != oldMark && attributeViewTypeMarkPattern.FindString(desc) != oldMark {
++		return refuseAttributeViewEdit("%s's description wasn't changed: \"%s\" says which Type %s holds. Keep it and change the rest.",
++			attributeViewFieldLabel(key), oldMark, attributeViewLabel(attrView))
++	}
++	return nil
++}
++
++// checkAttributeViewRelationChange refuses changing what a relation property links to, or whether
++// and with which field it is two-way, once it links to a database. Setting the first target
++// passes. The fields on the other side count too: the old partner loses its pairing, and the field
++// named as the new partner is pointed back at this one.
++func checkAttributeViewRelationChange(srcAv *av.AttributeView, operation *Operation, load attributeViewLoader) error {
++	key, _ := srcAv.GetKey(operation.KeyID)
++	if nil == key {
++		return nil
++	}
++	backKeyID := ""
++	if operation.IsTwoWay {
++		backKeyID = operation.BackRelationKeyID
++	}
++	relation := key.Relation
++	if nil != relation && "" != relation.AvID && isAttributeViewProperty(srcAv, key) &&
++		(relation.AvID != operation.ID || relation.IsTwoWay != operation.IsTwoWay || relation.BackKeyID != backKeyID) {
++		return attributeViewRelationRefusal(srcAv, key, false, load)
++	}
++	if nil != relation && relation.IsTwoWay && "" != relation.AvID &&
++		(relation.AvID != operation.ID || !operation.IsTwoWay || relation.BackKeyID != operation.BackRelationKeyID) {
++		if oldDest := load(relation.AvID); nil != oldDest {
++			oldBack, _ := oldDest.GetKey(relation.BackKeyID)
++			if nil != oldBack && nil != oldBack.Relation && oldBack.Relation.AvID == srcAv.ID && oldBack.Relation.IsTwoWay &&
++				isAttributeViewProperty(oldDest, oldBack) {
++				return attributeViewRelationRefusal(oldDest, oldBack, true, load)
++			}
++		}
++	}
++	if "" == operation.BackRelationKeyID {
++		return nil
++	}
++	dest := load(operation.ID)
++	if nil == dest {
++		return nil
++	}
++	back, _ := dest.GetKey(operation.BackRelationKeyID)
++	if nil == back || nil == back.Relation || "" == back.Relation.AvID || !isAttributeViewProperty(dest, back) {
++		return nil
++	}
++	pairedWith := ""
++	if operation.IsTwoWay {
++		pairedWith = operation.KeyID
++	}
++	if back.Relation.AvID != srcAv.ID || back.Relation.IsTwoWay != operation.IsTwoWay || back.Relation.BackKeyID != pairedWith {
++		return attributeViewRelationRefusal(dest, back, true, load)
++	}
++	return nil
++}
++
++func attributeViewRelationRefusal(attrView *av.AttributeView, key *av.Key, named bool, load attributeViewLoader) error {
++	label := attributeViewFieldLabel(key)
++	if named {
++		label += " in " + attributeViewLabel(attrView)
++	}
++	target := load(key.Relation.AvID)
++	pairing := ""
++	if key.Relation.IsTwoWay && nil != target {
++		if partner, _ := target.GetKey(key.Relation.BackKeyID); nil != partner {
++			pairing = ", paired with " + attributeViewFieldLabel(partner) + " there"
++		}
++	}
++	return refuseAttributeViewEdit("%s wasn't changed: it's a property linking to %s%s, and changing what it links to or its pairing would change what its links mean. Add a new relation field instead.",
++		label, attributeViewLabel(target), pairing)
++}
++
++// checkAttributeViewOptionChange refuses removing or renaming an option that rows of the database
++// use, other than the rows in except. Renaming onto an existing option, which merges the two, is a
++// rename.
++func checkAttributeViewOptionChange(attrView *av.AttributeView, key *av.Key, operation *Operation, remove bool, except map[string]bool) error {
++	if !isAttributeViewProperty(attrView, key) {
++		return nil
++	}
++	var oldName string
++	if remove {
++		oldName, _ = operation.Data.(string)
++	} else {
++		var data struct {
++			OldName string `json:"oldName"`
++			NewName string `json:"newName"`
++		}
++		encoded, err := json.Marshal(operation.Data)
++		if nil != err || nil != json.Unmarshal(encoded, &data) {
++			return nil
++		}
++		oldName = strings.TrimSpace(data.OldName)
++		if oldName == strings.TrimSpace(data.NewName) {
++			return nil
++		}
++	}
++	uses := attributeViewOptionUses(attrView, key.ID, oldName, except)
++	if 0 == uses {
++		return nil
++	}
++	verb := "renamed"
++	if remove {
++		verb = "removed"
++	}
++	if "tag" == attributeViewPropertyKey(key.Desc) {
++		return refuseAttributeViewEdit("The tag '%s' wasn't %s: %s. Use merge-tag.", oldName, verb, attributeViewRowsUsing(uses))
++	}
++	rows := "the rows"
++	if 1 == uses {
++		rows = "the row"
++	}
++	if remove {
++		return refuseAttributeViewEdit("The option '%s' wasn't removed from %s: %s. Move %s to another option first.",
++			oldName, attributeViewFieldLabel(key), attributeViewRowsUsing(uses), rows)
++	}
++	return refuseAttributeViewEdit("The option '%s' of %s wasn't renamed: %s. Add the new option and move %s to it first.",
++		oldName, attributeViewFieldLabel(key), attributeViewRowsUsing(uses), rows)
++}
++
++// pageDeletionRefusal refuses deleting a page through a block deletion, which removes the page's
++// rows and their values from every database and leaves the page. Pages are deleted from the tree.
++func pageDeletionRefusal(title string) error {
++	return refuseAttributeViewEdit("\"%s\" wasn't deleted: deleting a page as a block removes its rows from every database and leaves the page. Delete it from the page tree instead.", title)
++}
++
++func checkPageDeletion(id string) error {
++	bt := treenode.GetBlockTree(id)
++	if nil == bt || bt.ID != bt.RootID {
++		return nil
++	}
++	return pageDeletionRefusal(path.Base(bt.HPath))
++}
++
++// checkRefusedEdits checks a whole transaction before any of it is applied, so a refused edit
++// leaves nothing of the transaction behind. Each operation is checked against the databases as
++// they are now; the shared functions check again as each one runs.
++func (tx *Transaction) checkRefusedEdits() *TxErr {
++	for _, operation := range tx.DoOperations {
++		if nil == operation || nil != operation.attributeViewFields {
++			continue
++		}
++		var err error
++		switch operation.Action {
++		case "delete":
++			err = checkPageDeletion(operation.ID)
++		case "removeAttrViewCol", "updateAttrViewCol", "setAttrViewColDesc", "updateAttrViewColRelation",
++			"removeAttrViewColOption", "updateAttrViewColOption":
++			err = checkAttributeViewOperation(operation, tx.rowsPickedByUndoneEdit(operation, "removeAttrViewColOption" == operation.Action))
++		}
++		if nil != err {
++			return attributeViewTxErr(operation, err)
++		}
++	}
++	return nil
++}
++
++// rowsPickedByUndoneEdit are the rows an option removal that undoes an edit may clear: those the edit
++// set the field of. The editor undoes "add option" by removing the option, which also clears it from
++// the rows the same edit picked it on, so they always still use it. An undo carries the edit it undoes
++// as its undo operations; rows that took the option any other way are still counted.
++func (tx *Transaction) rowsPickedByUndoneEdit(operation *Operation, remove bool) map[string]bool {
++	if !remove || !tx.isReplay {
++		return nil
++	}
++	ret := map[string]bool{}
++	for _, undone := range tx.UndoOperations {
++		if nil == undone || undone.AvID != operation.AvID {
++			continue
++		}
++		switch undone.Action {
++		case "updateAttrViewCell":
++			if undone.KeyID == operation.ID {
++				ret[undone.RowID] = true
++			}
++		case "updateAttrViewCells":
++			for _, cell := range undone.CellUpdates {
++				if nil != cell && cell.KeyID == operation.ID {
++					ret[cell.RowID] = true
++				}
++			}
++		}
++	}
++	return ret
++}
++
++func checkAttributeViewOperation(operation *Operation, except map[string]bool) error {
++	attrView, err := av.ParseAttributeView(operation.AvID)
++	if nil != err || nil == attrView {
++		return nil
++	}
++	load := parsedAttributeViewLoader(attrView)
++	if "updateAttrViewColRelation" == operation.Action {
++		return checkAttributeViewRelationChange(attrView, operation, load)
++	}
++	key, _ := attrView.GetKey(operation.ID)
++	if nil == key {
++		return nil
++	}
++	switch operation.Action {
++	case "removeAttrViewCol":
++		return checkAttributeViewFieldRemoval(attrView, key, operation.RemoveDest, load)
++	case "updateAttrViewCol":
++		if "" != operation.Typ {
++			return checkAttributeViewFieldFormat(attrView, key, av.KeyType(operation.Typ))
++		}
++	case "setAttrViewColDesc":
++		desc, _ := operation.Data.(string)
++		return checkAttributeViewFieldDesc(attrView, key, desc)
++	case "removeAttrViewColOption":
++		return checkAttributeViewOptionChange(attrView, key, operation, true, except)
++	case "updateAttrViewColOption":
++		return checkAttributeViewOptionChange(attrView, key, operation, false, nil)
++	}
++	return nil
++}
+diff --git a/kernel/model/attribute_view_property_guard_test.go b/kernel/model/attribute_view_property_guard_test.go
+new file mode 100644
+index 0000000..e1d001e
+--- /dev/null
++++ b/kernel/model/attribute_view_property_guard_test.go
+@@ -0,0 +1,508 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"bytes"
++	"errors"
++	"os"
++	"slices"
++	"testing"
++
++	"github.com/88250/lute/ast"
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// propertyGuardFixture is a Tasks database whose fields are properties, keyed in their
++// descriptions, beside a Projects and a People database, with three Tasks and one Project.
++type propertyGuardFixture struct {
++	files                                             *fileOperationTestFixture
++	tasks, projects, people                           string
++	name, status, due, value, tag, project, seeAlso   string
++	scratch, mood, projectTasks, mentions, peopleName string
++	waiting, renewal, gardening                       string
++	databases                                         []string
++}
++
++func setupPropertyGuardTest(t *testing.T) *propertyGuardFixture {
++	t.Helper()
++	f := &propertyGuardFixture{files: setupFileOperationTest(t)}
++	oldLang, oldAVLangs := util.Lang, util.AttrViewLangs
++	util.Lang = "en"
++	util.AttrViewLangs = map[string]map[string]any{"en": {"key": "Key", "select": "Select", "table": "Table"}}
++	cache.ClearAVCache()
++	t.Cleanup(func() {
++		util.Lang, util.AttrViewLangs = oldLang, oldAVLangs
++		cache.ClearAVCache()
++	})
++
++	tasks, projects, people := av.NewAttributeView(ast.NewNodeID()), av.NewAttributeView(ast.NewNodeID()), av.NewAttributeView(ast.NewNodeID())
++	tasks.Name, projects.Name, people.Name = "Tasks", "Projects", "People"
++	f.tasks, f.projects, f.people = tasks.ID, projects.ID, people.ID
++	f.databases = []string{tasks.ID, projects.ID, people.ID}
++	f.waiting, f.renewal, f.gardening = ast.NewNodeID(), ast.NewNodeID(), ast.NewNodeID()
++	items := []string{f.waiting, f.renewal, f.gardening}
++	project := ast.NewNodeID()
++	row := func(view *av.AttributeView, item, title string) {
++		blockValues := view.GetBlockKeyValues()
++		blockValues.Values = append(blockValues.Values, &av.Value{ID: ast.NewNodeID(), KeyID: blockValues.Key.ID, BlockID: item,
++			Type: av.KeyTypeBlock, IsDetached: true, Block: &av.ValueBlock{Content: title}})
++	}
++	for i, title := range []string{"Get contract back", "Renew passport", "Plant bulbs"} {
++		row(tasks, items[i], title)
++	}
++	row(projects, project, "Kitchen")
++
++	name := tasks.KeyValues[0].Key
++	name.Name, name.Desc = "Name", "key: name (type: task)"
++	projects.KeyValues[0].Key.Name, projects.KeyValues[0].Key.Desc = "Name", "key: name (type: project)"
++	people.KeyValues[0].Key.Name, people.KeyValues[0].Key.Desc = "Name", "key: name"
++	people.KeyValues = people.KeyValues[:1]
++	f.name, f.peopleName = name.ID, people.KeyValues[0].Key.ID
++
++	field := func(view *av.AttributeView, name, desc string, typ av.KeyType, values map[string]*av.Value) *av.Key {
++		var key *av.Key
++		if av.KeyTypeSelect == typ && view == tasks && "Status" == name {
++			key = tasks.KeyValues[1].Key
++			key.Name, key.Desc = name, desc
++		} else {
++			key = &av.Key{ID: ast.NewNodeID(), Name: name, Desc: desc, Type: typ}
++			view.KeyValues = append(view.KeyValues, &av.KeyValues{Key: key})
++		}
++		kv, _ := view.GetKeyValues(key.ID)
++		for item, value := range values {
++			value.ID, value.KeyID, value.BlockID, value.Type = ast.NewNodeID(), key.ID, item, typ
++			kv.Values = append(kv.Values, value)
++		}
++		return key
++	}
++	selected := func(names ...string) *av.Value {
++		value := &av.Value{}
++		for _, name := range names {
++			value.MSelect = append(value.MSelect, &av.ValueSelect{Content: name})
++		}
++		return value
++	}
++	options := func(names ...string) (ret []*av.SelectOption) {
++		for i, name := range names {
++			ret = append(ret, &av.SelectOption{Name: name, Color: string(rune('1' + i))})
++		}
++		return
++	}
++
++	// "done" is held only by an item the database no longer lists, as a deleted page leaves it.
++	status := field(tasks, "Status", "key: status", av.KeyTypeSelect, map[string]*av.Value{
++		f.waiting: selected("waiting"), f.renewal: selected("waiting"), f.gardening: selected("open"), ast.NewNodeID(): selected("done")})
++	status.Options = options("open", "waiting", "done")
++	f.status = status.ID
++	f.due = field(tasks, "Due", "key: due", av.KeyTypeDate, map[string]*av.Value{
++		f.renewal: {Date: &av.ValueDate{Content: 1767225600000, IsNotEmpty: true}}}).ID
++	f.value = field(tasks, "Value", "key: value", av.KeyTypeNumber, map[string]*av.Value{
++		f.renewal: {Number: &av.ValueNumber{Content: 3, IsNotEmpty: true}}}).ID
++	tag := field(tasks, "Tag", "key: tag", av.KeyTypeMSelect, map[string]*av.Value{
++		f.waiting: selected("gardn"), f.renewal: selected("gardn", "garden"), f.gardening: selected("gardn")})
++	tag.Options = options("gardn", "garden")
++	f.tag = tag.ID
++	mood := field(tasks, "Mood", "", av.KeyTypeSelect, map[string]*av.Value{f.waiting: selected("calm")})
++	mood.Options = options("calm")
++	f.mood = mood.ID
++	f.scratch = field(tasks, "Scratch", "", av.KeyTypeText, map[string]*av.Value{
++		f.waiting: {Text: &av.ValueText{Content: "a one-off note"}}}).ID
++
++	// Project and Tasks, and See also and Mentions, are two-way pairs; See also is outside the schema.
++	f.project, f.projectTasks, f.seeAlso, f.mentions = ast.NewNodeID(), ast.NewNodeID(), ast.NewNodeID(), ast.NewNodeID()
++	pair := func(source, dest *av.AttributeView, sourceKey, destKey, sourceName, destName, sourceDesc, destDesc string) {
++		field(source, sourceName, sourceDesc, av.KeyTypeRelation, nil).ID = sourceKey
++		source.KeyValues[len(source.KeyValues)-1].Key.Relation = &av.Relation{AvID: dest.ID, IsTwoWay: true, BackKeyID: destKey}
++		field(dest, destName, destDesc, av.KeyTypeRelation, nil).ID = destKey
++		dest.KeyValues[len(dest.KeyValues)-1].Key.Relation = &av.Relation{AvID: source.ID, IsTwoWay: true, BackKeyID: sourceKey}
++	}
++	pair(tasks, projects, f.project, f.projectTasks, "Project", "Tasks", "key: project", "key: tasks")
++	pair(tasks, projects, f.seeAlso, f.mentions, "See also", "Mentions", "", "key: mentions")
++	projectValues, _ := tasks.GetKeyValues(f.project)
++	projectValues.Values = []*av.Value{{ID: ast.NewNodeID(), KeyID: f.project, BlockID: f.renewal, Type: av.KeyTypeRelation,
++		Relation: &av.ValueRelation{BlockIDs: []string{project}}}}
++	taskValues, _ := projects.GetKeyValues(f.projectTasks)
++	taskValues.Values = []*av.Value{{ID: ast.NewNodeID(), KeyID: f.projectTasks, BlockID: project, Type: av.KeyTypeRelation,
++		Relation: &av.ValueRelation{BlockIDs: []string{f.renewal}}}}
++
++	for _, view := range []*av.AttributeView{tasks, projects, people} {
++		if err := av.SaveAttributeView(view); nil != err {
++			t.Fatalf("save database failed: %s", err)
++		}
++	}
++	av.UpsertAvBackRel(tasks.ID, projects.ID)
++	av.UpsertAvBackRel(projects.ID, tasks.ID)
++	return f
++}
++
++// stored is every database file as it is on disk.
++func (f *propertyGuardFixture) stored(t *testing.T) [][]byte {
++	t.Helper()
++	var ret [][]byte
++	for _, id := range f.databases {
++		data, err := os.ReadFile(av.GetAttributeViewDataPath(id))
++		if nil != err {
++			t.Fatalf("read database [%s] failed: %s", id, err)
++		}
++		ret = append(ret, data)
++	}
++	return ret
++}
++
++func (f *propertyGuardFixture) key(t *testing.T, avID, keyID string) *av.Key {
++	t.Helper()
++	view, err := av.ParseAttributeView(avID)
++	if nil != err {
++		t.Fatalf("parse database failed: %s", err)
++	}
++	key, _ := view.GetKey(keyID)
++	return key
++}
++
++func optionNames(key *av.Key) (ret []string) {
++	for _, option := range key.Options {
++		ret = append(ret, option.Name)
++	}
++	return
++}
++
++// inEditor applies operations as the editor's transactions do.
++func inEditor(operations ...*Operation) error {
++	return PerformTxSync(&Transaction{DoOperations: operations})
++}
++
++// addingOption is the editor's "add option" typed into a Status cell: it adds the option and picks it
++// on the row.
++func addingOption(f *propertyGuardFixture, name, row string) []*Operation {
++	return []*Operation{
++		{Action: "updateAttrViewColOptions", AvID: f.tasks, ID: f.status, Data: []*av.SelectOption{{Name: name, Color: "4"}}},
++		{Action: "updateAttrViewCell", AvID: f.tasks, KeyID: f.status, RowID: row,
++			Data: map[string]any{"mSelect": []any{map[string]any{"content": name}}}},
++	}
++}
++
++// undoing applies an edit's inverse as the editor's undo does: replayed, carrying the edit as its
++// undo operations.
++func undoing(edit []*Operation, inverse ...*Operation) error {
++	tx := &Transaction{DoOperations: inverse, UndoOperations: edit}
++	tx.MarkReplay()
++	return PerformTxSync(tx)
++}
++
++func TestAttributeViewPropertyGuardRefusesUndoingAddOptionOtherRowsUse(t *testing.T) {
++	f := setupPropertyGuardTest(t)
++	// "blocked" is added and picked on one Task, then picked on another, as from another page's table.
++	if err := inEditor(addingOption(f, "blocked", f.gardening)...); nil != err {
++		t.Fatal(err)
++	}
++	if err := inEditor(addingOption(f, "blocked", f.renewal)[1]); nil != err {
++		t.Fatal(err)
++	}
++	before := f.stored(t)
++	err := undoing(addingOption(f, "blocked", f.gardening),
++		&Operation{Action: "removeAttrViewColOption", AvID: f.tasks, ID: f.status, Data: "blocked"})
++	if want := "The option 'blocked' wasn't removed from Status: 1 row uses it. Move the row to another option first."; nil == err || err.Error() != want {
++		t.Fatalf("want the refusal\n  %s\ngot\n  %v", want, err)
++	}
++	for i, data := range f.stored(t) {
++		if !bytes.Equal(before[i], data) {
++			t.Fatalf("the refused undo changed database [%s]", f.databases[i])
++		}
++	}
++}
++
++func TestAttributeViewPropertyGuardRefusesEditsThatDestroyValues(t *testing.T) {
++	const (
++		statusDeleted = "Status wasn't deleted: it's a property, and deleting it would empty the Status of every row in Tasks. Hide it from the view instead."
++		dueFormat     = "Due's format wasn't changed: it's a property, and its values in Tasks would stop meaning what they mean. Add a new field with that format instead."
++		statusDesc    = "Status's description wasn't changed: \"key: status\" marks it as a property, and every view and rule relies on it. Keep it at the start and put any other text after a space."
++		nameMark      = "Name's description wasn't changed: \"(type: task)\" says which Type Tasks holds. Keep it and change the rest."
++		projectLink   = "Project wasn't changed: it's a property linking to Projects, paired with Tasks there, and changing what it links to or its pairing would change what its links mean. Add a new relation field instead."
++		waitingGone   = "The option 'waiting' wasn't removed from Status: 2 rows use it. Move the rows to another option first."
++		waitingRename = "The option 'waiting' of Status wasn't renamed: 2 rows use it. Add the new option and move the rows to it first."
++		tagGone       = "The tag 'gardn' wasn't removed: 3 rows use it. Use merge-tag."
++		tagRenamed    = "The tag 'gardn' wasn't renamed: 3 rows use it. Use merge-tag."
++		pageDeleted   = "\"Source\" wasn't deleted: deleting a page as a block removes its rows from every database and leaves the page. Delete it from the page tree instead."
++	)
++	cases := []struct {
++		name string
++		edit func(f *propertyGuardFixture) error
++		want string
++	}{
++		{"deleting a property", func(f *propertyGuardFixture) error {
++			return RemoveAttributeViewKey(f.tasks, f.status, false)
++		}, statusDeleted},
++		{"deleting a property in the editor", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "removeAttrViewCol", AvID: f.tasks, ID: f.status})
++		}, statusDeleted},
++		{"deleting a field whose partner property goes with it", func(f *propertyGuardFixture) error {
++			return RemoveAttributeViewKey(f.tasks, f.seeAlso, true)
++		}, "See also wasn't deleted: its pair, Mentions in Projects, is a property and would be deleted with it, emptying it on every row. Delete See also alone, keeping Mentions, or hide it from the view instead."},
++		{"changing a property's format", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumn(&Operation{AvID: f.tasks, ID: f.due, Name: "Due", Typ: string(av.KeyTypeText)})
++		}, dueFormat},
++		{"changing a property's format over MCP", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.due, map[string]any{"type": "text"})
++		}, dueFormat},
++		{"changing a property's format in a paste with a header row", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "updateAttrViewCol", AvID: f.tasks, ID: f.scratch, Name: "Notes", Typ: "text"},
++				&Operation{Action: "updateAttrViewCol", AvID: f.tasks, ID: f.due, Name: "When", Typ: "text"})
++		}, dueFormat},
++		{"removing a property's key", func(f *propertyGuardFixture) error {
++			return setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: f.status, Data: "Task state"})
++		}, statusDesc},
++		{"changing a property's key in the editor", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.status, Data: "key: state"})
++		}, statusDesc},
++		{"removing the Type mark", func(f *propertyGuardFixture) error {
++			return setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: f.name, Data: "key: name"})
++		}, nameMark},
++		{"changing the Type mark over MCP", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.name, map[string]any{"desc": "key: name (type: note)"})
++		}, nameMark},
++		{"pointing a relation property at another database", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: f.project, Format: "Project"})
++		}, projectLink},
++		{"breaking a relation property's pairing", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.projects, KeyID: f.project, Format: "Project"})
++		}, projectLink},
++		{"breaking a relation property's pairing over MCP", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.project, map[string]any{"relation": map[string]any{"avID": f.projects, "isTwoWay": false}})
++		}, projectLink},
++		{"pairing a relation property with another field", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "updateAttrViewColRelation", AvID: f.tasks, ID: f.projects, KeyID: f.project, Format: "Project",
++				IsTwoWay: true, BackRelationKeyID: ast.NewNodeID(), Name: "Jobs"})
++		}, projectLink},
++		{"taking a relation property's partner as another field's", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.projects, KeyID: f.scratch, Format: "Scratch",
++				IsTwoWay: true, BackRelationKeyID: f.projectTasks, Name: "Tasks"})
++		}, "Tasks in Projects wasn't changed: it's a property linking to Tasks, paired with Project there, and changing what it links to or its pairing would change what its links mean. Add a new relation field instead."},
++		{"removing an option rows use", func(f *propertyGuardFixture) error {
++			return removeAttributeViewColumnOption(&Operation{AvID: f.tasks, ID: f.status, Data: "waiting"})
++		}, waitingGone},
++		{"removing an option rows use in the editor", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "removeAttrViewColOption", AvID: f.tasks, ID: f.status, Data: "waiting"})
++		}, waitingGone},
++		{"renaming an option rows use", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumnOption(&Operation{AvID: f.tasks, ID: f.status,
++				Data: map[string]any{"oldName": "waiting", "newName": "blocked"}})
++		}, waitingRename},
++		{"merging an option rows use into another", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumnOption(&Operation{AvID: f.tasks, ID: f.status,
++				Data: map[string]any{"oldName": "waiting", "newName": "open"}})
++		}, waitingRename},
++		{"removing a tag rows use", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.tag, map[string]any{"optionRemove": "gardn"})
++		}, tagGone},
++		{"renaming a tag rows use over MCP", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.tag, map[string]any{"optionUpdate": map[string]any{"name": "gardn", "newName": "gardening"}})
++		}, tagRenamed},
++		{"deleting a page as a block", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "delete", ID: f.files.sourceID})
++		}, pageDeleted},
++		{"deleting a page with the block API", func(f *propertyGuardFixture) error {
++			_, err := PerformBlockOperation(&Operation{Action: "delete", ID: f.files.sourceID})
++			return err
++		}, pageDeleted},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			f := setupPropertyGuardTest(t)
++			before := f.stored(t)
++			err := c.edit(f)
++			if nil == err || err.Error() != c.want {
++				t.Fatalf("want the refusal\n  %s\ngot\n  %v", c.want, err)
++			}
++			var txErr *TxErr
++			if errors.As(err, &txErr) && TxErrCodeRefused != txErr.Code() {
++				t.Fatalf("a refused transaction should reload the windows, got code %d", txErr.Code())
++			}
++			for i, data := range f.stored(t) {
++				if !bytes.Equal(before[i], data) {
++					t.Fatalf("the refused edit changed database [%s]", f.databases[i])
++				}
++			}
++			if nil == treenode.GetBlockTree(f.files.sourceID) || !f.files.box.Exist(f.files.sourcePath) {
++				t.Fatal("the refused edit removed the page")
++			}
++		})
++	}
++}
++
++func TestAttributeViewPropertyGuardAllowsEditsThatLoseNothing(t *testing.T) {
++	cases := []struct {
++		name  string
++		edit  func(f *propertyGuardFixture) error
++		check func(t *testing.T, f *propertyGuardFixture)
++	}{
++		{"renaming a property", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumn(&Operation{AvID: f.tasks, ID: f.status, Name: "State", Typ: string(av.KeyTypeSelect)})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if key := f.key(t, f.tasks, f.status); "State" != key.Name || av.KeyTypeSelect != key.Type {
++				t.Fatalf("want State, a select, got %s, a %s", key.Name, key.Type)
++			}
++		}},
++		{"removing an option no row uses", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "removeAttrViewColOption", AvID: f.tasks, ID: f.status, Data: "done"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if names := optionNames(f.key(t, f.tasks, f.status)); !slices.Equal(names, []string{"open", "waiting"}) {
++				t.Fatalf("want open and waiting left, got %v", names)
++			}
++		}},
++		{"renaming an option no row uses", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumnOption(&Operation{AvID: f.tasks, ID: f.status,
++				Data: map[string]any{"oldName": "done", "newName": "finished"}})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if names := optionNames(f.key(t, f.tasks, f.status)); !slices.Equal(names, []string{"open", "waiting", "finished"}) {
++				t.Fatalf("want done renamed finished, got %v", names)
++			}
++		}},
++		{"recolouring an option rows use", func(f *propertyGuardFixture) error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.status, map[string]any{"optionUpdate": map[string]any{"name": "waiting", "color": "7"}})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if color := f.key(t, f.tasks, f.status).GetOption("waiting").Color; "7" != color {
++				t.Fatalf("want waiting coloured 7, got %s", color)
++			}
++		}},
++		{"adding and reordering options", func(f *propertyGuardFixture) error {
++			return updateAttributeViewColumnOptions(&Operation{AvID: f.tasks, ID: f.status, Data: []*av.SelectOption{
++				{Name: "done", Color: "3"}, {Name: "blocked", Color: "4"}, {Name: "waiting", Color: "2"}, {Name: "open", Color: "1"}}})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if names := optionNames(f.key(t, f.tasks, f.status)); !slices.Equal(names, []string{"done", "blocked", "waiting", "open"}) {
++				t.Fatalf("want the options added and reordered, got %v", names)
++			}
++		}},
++		{"undoing add option", func(f *propertyGuardFixture) error {
++			// The editor undoes "add option" by removing the option, which also clears the row it was picked on.
++			if err := inEditor(addingOption(f, "blocked", f.gardening)...); nil != err {
++				return err
++			}
++			return undoing(addingOption(f, "blocked", f.gardening),
++				&Operation{Action: "removeAttrViewColOption", AvID: f.tasks, ID: f.status, Data: "blocked"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if names := optionNames(f.key(t, f.tasks, f.status)); slices.Contains(names, "blocked") {
++				t.Fatalf("want blocked gone, got %v", names)
++			}
++		}},
++		{"removing an option rows use on a field outside the schema", func(f *propertyGuardFixture) error {
++			return removeAttributeViewColumnOption(&Operation{AvID: f.tasks, ID: f.mood, Data: "calm"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if names := optionNames(f.key(t, f.tasks, f.mood)); 0 != len(names) {
++				t.Fatalf("want calm gone, got %v", names)
++			}
++		}},
++		{"changing how a number and a date are shown", func(f *propertyGuardFixture) error {
++			if err := UpdateAttributeViewKeyConfig(f.tasks, f.value, map[string]any{"numberFormat": "commas"}); nil != err {
++				return err
++			}
++			return UpdateAttributeViewKeyConfig(f.tasks, f.due, map[string]any{"dateFormat": "year-month-day"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			value, due := f.key(t, f.tasks, f.value), f.key(t, f.tasks, f.due)
++			if "commas" != string(value.NumberFormat) || av.DateDisplayFormatYearMonthDay != due.DateFormat {
++				t.Fatalf("want commas and year-month-day, got %s and %s", value.NumberFormat, due.DateFormat)
++			}
++		}},
++		{"adding a note after a property's key", func(f *propertyGuardFixture) error {
++			return inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.status, Data: "key: status Where the Task stands"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if desc := f.key(t, f.tasks, f.status).Desc; "key: status Where the Task stands" != desc {
++				t.Fatalf("want the note added, got %q", desc)
++			}
++		}},
++		{"adding a key to a field outside the schema", func(f *propertyGuardFixture) error {
++			return setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: f.scratch, Data: "key: scratch"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if desc := f.key(t, f.tasks, f.scratch).Desc; "key: scratch" != desc {
++				t.Fatalf("want the key added, got %q", desc)
++			}
++		}},
++		{"adding a Type mark", func(f *propertyGuardFixture) error {
++			return setAttributeViewColDesc(&Operation{AvID: f.people, ID: f.peopleName, Data: "key: name (type: person)"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if desc := f.key(t, f.people, f.peopleName).Desc; "key: name (type: person)" != desc {
++				t.Fatalf("want the Type mark added, got %q", desc)
++			}
++		}},
++		{"giving a relation property its first target", func(f *propertyGuardFixture) error {
++			owner := ast.NewNodeID()
++			if err := AddAttributeViewKey(f.tasks, "", owner, "Owner", string(av.KeyTypeRelation), "", "", ""); nil != err {
++				return err
++			}
++			if err := setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: owner, Data: "key: owner"}); nil != err {
++				return err
++			}
++			f.scratch = owner
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: owner, Format: "Owner"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if relation := f.key(t, f.tasks, f.scratch).Relation; nil == relation || f.people != relation.AvID {
++				t.Fatalf("want Owner linking to People, got %+v", relation)
++			}
++		}},
++		{"undoing add field", func(f *propertyGuardFixture) error {
++			added := ast.NewNodeID()
++			f.scratch = added
++			if err := inEditor(&Operation{Action: "addAttrViewCol", AvID: f.tasks, ID: added, Name: "Text", Typ: "text"}); nil != err {
++				return err
++			}
++			return inEditor(&Operation{Action: "removeAttrViewCol", AvID: f.tasks, ID: added})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if key := f.key(t, f.tasks, f.scratch); nil != key {
++				t.Fatalf("want the added field gone, got %s", key.Name)
++			}
++		}},
++		{"undoing duplicate field", func(f *propertyGuardFixture) error {
++			copied := ast.NewNodeID()
++			f.scratch = copied
++			if err := inEditor(&Operation{Action: "duplicateAttrViewKey", AvID: f.tasks, KeyID: f.status, NextID: copied}); nil != err {
++				return err
++			}
++			return inEditor(&Operation{Action: "removeAttrViewCol", AvID: f.tasks, ID: copied})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if nil != f.key(t, f.tasks, f.scratch) || nil == f.key(t, f.tasks, f.status) {
++				t.Fatal("want the copy gone and Status kept")
++			}
++		}},
++		{"deleting a field outside the schema", func(f *propertyGuardFixture) error {
++			return RemoveAttributeViewKey(f.tasks, f.scratch, false)
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if key := f.key(t, f.tasks, f.scratch); nil != key {
++				t.Fatalf("want Scratch gone, got %s", key.Name)
++			}
++		}},
++		{"deleting a block inside a page", func(f *propertyGuardFixture) error {
++			// Only the check: applying a deletion needs the SQL index this setup lacks.
++			if txErr := (&Transaction{DoOperations: []*Operation{{Action: "delete", ID: f.files.childID}}}).checkRefusedEdits(); nil != txErr {
++				return txErr
++			}
++			return nil
++		}, func(t *testing.T, f *propertyGuardFixture) {}},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			f := setupPropertyGuardTest(t)
++			if err := c.edit(f); nil != err {
++				t.Fatalf("want the edit to go through, got %v", err)
++			}
++			cache.ClearAVCache()
++			c.check(t, f)
++		})
++	}
++}
+diff --git a/kernel/model/block_operation.go b/kernel/model/block_operation.go
+index 123632f..33ef53e 100644
+--- a/kernel/model/block_operation.go
++++ b/kernel/model/block_operation.go
+@@ -46,7 +46,7 @@ func PerformBlockOperation(operation *Operation) (transactions []*Transaction, e
+ 			return nil, fmt.Errorf("block not found [%s]", operation.ID)
+ 		}
+ 		if node == tree.Root {
+-			return nil, fmt.Errorf("document cannot be deleted as a block [%s]", operation.ID)
++			return nil, pageDeletionRefusal(tree.Root.IALAttr("title"))
+ 		}
+ 	default:
+ 		return nil, fmt.Errorf("unsupported block operation [%s]", operation.Action)
+diff --git a/kernel/model/transaction.go b/kernel/model/transaction.go
+index 1556374..b80461f 100644
+--- a/kernel/model/transaction.go
++++ b/kernel/model/transaction.go
+@@ -142,6 +142,11 @@ func flushTx(tx *Transaction) {
+ 			logging.LogErrorf("transaction failed and requires UI reload: %s", txErr.msg)
+ 			util.ReloadUI()
+ 			return
++		case TxErrCodeRefused:
++			// The windows already show the edit, and a reload is the only way to take it back.
++			logging.LogWarnf("refused transaction: %s", txErr.msg)
++			util.ReloadUIWithMsg(txErr.msg)
++			return
+ 		case TxErrCodeDataIsSyncing:
+ 			util.PushMsg(Conf.Language(222), 5000)
+ 		case TxErrHandleAttributeView:
+@@ -194,6 +199,7 @@ const (
+ 	TxErrCodePushMsg         = 4
+ 	TxErrCodeSkipTx          = 5 // 操作被跳过，不弹状态异常
+ 	TxErrCodeReloadUI        = 6 // 事务已回滚，重新加载界面以恢复前后端一致状态
++	TxErrCodeRefused         = 7 // The edit was refused before anything changed: reload the windows, then say why
+ )
+ 
+ type TxErr struct {
+@@ -248,6 +254,11 @@ func performTx(tx *Transaction) (ret *TxErr) {
+ 		}
+ 	}()
+ 
++	if ret = tx.checkRefusedEdits(); nil != ret {
++		tx.rollback()
++		return
++	}
++
+ 	isLargeInsert := tx.processLargeInsert()
+ 	isLargeDelete := tx.processLargeDelete()
+ 	if !isLargeInsert {
+diff --git a/kernel/util/websocket.go b/kernel/util/websocket.go
+index 8eba819..a64403a 100644
+--- a/kernel/util/websocket.go
++++ b/kernel/util/websocket.go
+@@ -174,6 +174,9 @@ func AddPushChan(session *melody.Session) {
+ 		} else {
+ 			(appSessions.(*sync.Map)).Store(id, session)
+ 		}
++		if "main" == typ && !isPublishSession(session) {
++			pushReloadNotices(session)
++		}
+ 	}
+ }
+ 
+@@ -270,6 +273,56 @@ func ReloadUI() {
+ 	BroadcastByType("main", "reloadui", 0, "", nil)
+ }
+ 
++// reloadNotices are messages for the windows a reload sends away. Each window that connects again
++// within a minute is shown each one, up to as many windows as were open.
++var (
++	reloadNotices     []*reloadNotice
++	reloadNoticesLock sync.Mutex
++)
++
++type reloadNotice struct {
++	msg   string
++	left  int
++	until time.Time
++}
++
++// ReloadUIWithMsg reloads every open window, as ReloadUI does, and shows msg in each once it has
++// connected again: a message sent before the reload would go with the page.
++func ReloadUIWithMsg(msg string) {
++	open := len(SessionsByType("main"))
++	if 0 == open {
++		return
++	}
++	reloadNoticesLock.Lock()
++	reloadNotices = append(reloadNotices, &reloadNotice{msg: msg, left: open, until: time.Now().Add(time.Minute)})
++	reloadNoticesLock.Unlock()
++	ReloadUI()
++}
++
++func pushReloadNotices(session *melody.Session) {
++	reloadNoticesLock.Lock()
++	defer reloadNoticesLock.Unlock()
++	now := time.Now()
++	var kept []*reloadNotice
++	for _, notice := range reloadNotices {
++		if now.After(notice.until) {
++			continue
++		}
++		// Shown as information, which stays until closed: an error's text gets SiYuan's version added,
++		// as for a bug report.
++		event := NewResult()
++		event.Cmd = "msg"
++		event.Msg = notice.msg
++		event.Data = map[string]any{"id": gulu.Rand.String(7), "closeTimeout": 0}
++		session.Write(event.Bytes())
++		notice.left--
++		if 0 < notice.left {
++			kept = append(kept, notice)
++		}
++	}
++	reloadNotices = kept
++}
++
+ // ReloadPublishServiceSessions 通知所有已打开的发布服务页面刷新，使发布插件设置立即生效。
+ func ReloadPublishServiceSessions() {
+ 	for _, session := range publishSessionsByType("main") {
+-- 
+2.53.0
+

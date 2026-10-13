@@ -15,7 +15,7 @@ WORKDIR /src/kernel
 ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg \
     go test -tags "fts5 sqlcipher" ./mcp/ \
-    && go test -tags "fts5 sqlcipher" -run '^TestAttributeViewPropertyGuard' ./model/ \
+    && go test -tags "fts5 sqlcipher" -run '^TestAttributeViewPropertyGuard|^TestSystemPageGuard' ./model/ \
     && go build -tags "fts5 sqlcipher" -ldflags "-s -w"
 
 FROM b3log/siyuan:${SIYUAN_VERSION}

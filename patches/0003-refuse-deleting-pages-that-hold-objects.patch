@@ -1,0 +1,293 @@
+From c9d385ea02824698391093500386cc9368793250 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 20:51:37 -0400
+Subject: [PATCH] Deleting a page or a notebook that holds a Type's pages is
+ refused
+
+Deleting a page deletes the pages under it, and removing a notebook deletes
+every page in it. A system page, one whose custom-object-type is "system", is
+scaffolding such as a home folder, and a home folder like People holds every
+page of its Type in its notebook, so deleting it took them all, and their rows
+with them. Deleting a system page is now refused while pages sit under it, and
+so is removing a notebook that holds a system page, with the reason as the
+error: "People wasn't deleted: 120 pages are under it and would go with it.
+Move or delete the pages under it first." A system page with nothing under it,
+and any page that isn't a system page, are deleted as before.
+
+The checks sit in RemoveDoc, RemoveDocs and RemoveBox, which the page tree, the
+Delete key, the page menu, /api/filetree/removeDoc, removeDocByID and
+removeDocs, /api/notebook/removeNotebook, the MCP document and notebook tools
+and the CLI all reach, and a deletion of several pages is checked whole before
+any of them goes. Files deleted directly, a snapshot checkout and sync go
+around them.
+---
+ kernel/model/file.go                   |   8 ++
+ kernel/model/mount.go                  |   3 +
+ kernel/model/system_page_guard.go      |  86 ++++++++++++++++++
+ kernel/model/system_page_guard_test.go | 121 +++++++++++++++++++++++++
+ 4 files changed, 218 insertions(+)
+ create mode 100644 kernel/model/system_page_guard.go
+ create mode 100644 kernel/model/system_page_guard_test.go
+
+diff --git a/kernel/model/file.go b/kernel/model/file.go
+index 5ef8161..57668a6 100644
+--- a/kernel/model/file.go
++++ b/kernel/model/file.go
+@@ -2017,6 +2017,9 @@ func RemoveDoc(boxID, p string) error {
+ 	if IsBoxDocPath(boxID, p) {
+ 		return errors.New(Conf.Language(341))
+ 	}
++	if err := systemPageDeletionRefusal(box, p); nil != err {
++		return err
++	}
+ 
+ 	FlushTxQueue()
+ 	luteEngine := util.NewLute()
+@@ -2044,6 +2047,11 @@ func RemoveDocs(paths []string) error {
+ 		if nil != box && IsBoxDocPath(box.ID, p) {
+ 			return errors.New(Conf.Language(341))
+ 		}
++		if nil != box {
++			if err := systemPageDeletionRefusal(box, p); nil != err {
++				return err
++			}
++		}
+ 	}
+ 	FlushTxQueue()
+ 	luteEngine := util.NewLute()
+diff --git a/kernel/model/mount.go b/kernel/model/mount.go
+index fabf5b5..10c588a 100644
+--- a/kernel/model/mount.go
++++ b/kernel/model/mount.go
+@@ -277,6 +277,9 @@ func RemoveBox(boxID string) (err error) {
+ 	if util.IsReservedFilename(boxID) {
+ 		return fmt.Errorf("can not remove [%s] caused by it is a reserved file", boxID)
+ 	}
++	if err = systemNotebookRemovalRefusal(boxID); nil != err {
++		return
++	}
+ 
+ 	FlushTxQueue()
+ 	sql.FlushQueue()
+diff --git a/kernel/model/system_page_guard.go b/kernel/model/system_page_guard.go
+new file mode 100644
+index 0000000..26e8182
+--- /dev/null
++++ b/kernel/model/system_page_guard.go
+@@ -0,0 +1,86 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"fmt"
++	"io/fs"
++	"path/filepath"
++	"strings"
++
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Deleting a page deletes the pages under it, and removing a notebook deletes every page in it. A
++// system page, one whose custom-object-type is "system", is scaffolding such as a home folder, and a
++// home folder like People holds every page of its Type in the notebook. So deleting a system page is
++// refused while pages sit under it, and so is removing a notebook that holds a system page. Every way
++// of deleting a page reaches RemoveDoc or RemoveDocs, and every way of removing a notebook reaches
++// RemoveBox; files deleted directly, a snapshot checkout and sync go around them.
++
++const systemPageType = "system"
++
++// systemPageDeletionRefusal refuses deleting a system page while pages sit under it.
++func systemPageDeletionRefusal(box *Box, p string) error {
++	ial := filesys.DocIAL(filepath.Join(util.DataDir, box.ID, p))
++	if systemPageType != ial["custom-object-type"] {
++		return nil
++	}
++	under := 0
++	_ = filepath.WalkDir(filepath.Join(util.DataDir, box.ID, strings.TrimSuffix(p, ".sy")),
++		func(path string, entry fs.DirEntry, err error) error {
++			if nil == err && !entry.IsDir() && strings.HasSuffix(path, ".sy") {
++				under++
++			}
++			return nil
++		})
++	if 0 == under {
++		return nil
++	}
++	pages := fmt.Sprintf("%d pages are", under)
++	if 1 == under {
++		pages = "1 page is"
++	}
++	return fmt.Errorf("%s wasn't deleted: %s under it and would go with it. Move or delete the pages under it first.",
++		ial["title"], pages)
++}
++
++// systemNotebookRemovalRefusal refuses removing a notebook that holds a system page.
++func systemNotebookRemovalRefusal(boxID string) error {
++	var held string
++	_ = filepath.WalkDir(filepath.Join(util.DataDir, boxID), func(path string, entry fs.DirEntry, err error) error {
++		if nil != err {
++			return nil
++		}
++		if entry.IsDir() && ".siyuan" == entry.Name() {
++			return filepath.SkipDir
++		}
++		if !entry.IsDir() && strings.HasSuffix(path, ".sy") {
++			if ial := filesys.DocIAL(path); systemPageType == ial["custom-object-type"] {
++				held = ial["title"]
++				return filepath.SkipAll
++			}
++		}
++		return nil
++	})
++	if "" == held {
++		return nil
++	}
++	return fmt.Errorf("%s wasn't removed: it holds system pages, such as %s, and removing it would delete every page in it. Delete its pages first.",
++		(&Box{ID: boxID}).GetConf().Name, held)
++}
+diff --git a/kernel/model/system_page_guard_test.go b/kernel/model/system_page_guard_test.go
+new file mode 100644
+index 0000000..fde3307
+--- /dev/null
++++ b/kernel/model/system_page_guard_test.go
+@@ -0,0 +1,121 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"path/filepath"
++	"testing"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/filelock"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// systemPageGuardFixture is the file operation fixture's notebook with a People home folder, a system
++// page holding one Person page, and a Dashboard, a system page with nothing under it.
++type systemPageGuardFixture struct {
++	files                  *fileOperationTestFixture
++	people, ada, dashboard *parse.Tree
++}
++
++func setupSystemPageGuardTest(t *testing.T) *systemPageGuardFixture {
++	t.Helper()
++	f := &systemPageGuardFixture{files: setupFileOperationTest(t)}
++	page := func(boxID, path, hpath, title, objectType string) *parse.Tree {
++		tree := treenode.NewTree(boxID, path, hpath, title)
++		tree.Root.SetIALAttr("custom-object-type", objectType)
++		if _, err := filesys.WriteTree(tree); nil != err {
++			t.Fatalf("write test page failed: %v", err)
++		}
++		treenode.UpsertBlockTree(tree)
++		t.Cleanup(func() {
++			cache.RemoveTreeData(tree.ID)
++			cache.RemoveDocIAL(tree.Path)
++		})
++		return tree
++	}
++	box := f.files.box.ID
++	f.people = page(box, "/20260718000010-peoplex.sy", "/People", "People", systemPageType)
++	f.ada = page(box, "/20260718000010-peoplex/20260718000011-adaxxxx.sy", "/People/Ada", "Ada", "person")
++	f.dashboard = page(box, "/20260718000012-dashbrd.sy", "/Dashboard", "Dashboard", systemPageType)
++	return f
++}
++
++func (f *systemPageGuardFixture) assertNothingDeleted(t *testing.T, way string) {
++	t.Helper()
++	for _, tree := range []*parse.Tree{f.people, f.ada, f.dashboard} {
++		if !filelock.IsExist(filepath.Join(util.DataDir, tree.Box, tree.Path)) {
++			t.Fatalf("%s deleted %s", way, tree.HPath)
++		}
++	}
++}
++
++func TestSystemPageGuardRefusesDeletingASystemPageWithPagesUnderIt(t *testing.T) {
++	f := setupSystemPageGuardTest(t)
++	box := f.files.box.ID
++	const want = "People wasn't deleted: 1 page is under it and would go with it. Move or delete the pages under it first."
++	for _, way := range []struct {
++		name   string
++		remove func() error
++	}{
++		{"RemoveDoc", func() error { return RemoveDoc(box, f.people.Path) }},
++		{"RemoveDocs", func() error { return RemoveDocs([]string{box + f.dashboard.Path, box + f.people.Path}) }},
++	} {
++		if err := way.remove(); nil == err || want != err.Error() {
++			t.Fatalf("%s: want %q, got %v", way.name, want, err)
++		}
++		f.assertNothingDeleted(t, way.name)
++	}
++}
++
++func TestSystemPageGuardRefusesRemovingANotebookHoldingASystemPage(t *testing.T) {
++	f := setupSystemPageGuardTest(t)
++	const want = "File operation test wasn't removed: it holds system pages, such as People, and removing it would " +
++		"delete every page in it. Delete its pages first."
++	if err := RemoveBox(f.files.box.ID); nil == err || want != err.Error() {
++		t.Fatalf("want %q, got %v", want, err)
++	}
++	f.assertNothingDeleted(t, "RemoveBox")
++}
++
++func TestSystemPageGuardAllowsWhatDeletesNoOtherPage(t *testing.T) {
++	f := setupSystemPageGuardTest(t)
++	box := f.files.box
++	for name, path := range map[string]string{
++		"a system page with nothing under it": f.dashboard.Path,
++		"a page under a system page":          f.ada.Path,
++		"a page that isn't a system page":     f.files.sourcePath,
++	} {
++		if err := systemPageDeletionRefusal(box, path); nil != err {
++			t.Errorf("deleting %s was refused: %v", name, err)
++		}
++	}
++	other := treenode.NewTree("20260718000020-otherbx", "/20260718000021-pagexxx.sy", "/Page", "Page")
++	if _, err := filesys.WriteTree(other); nil != err {
++		t.Fatalf("write test page failed: %v", err)
++	}
++	t.Cleanup(func() {
++		cache.RemoveTreeData(other.ID)
++		cache.RemoveDocIAL(other.Path)
++	})
++	if err := systemNotebookRemovalRefusal(other.Box); nil != err {
++		t.Errorf("removing a notebook with no system page was refused: %v", err)
++	}
++}
+-- 
+2.53.0
+

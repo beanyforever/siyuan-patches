@@ -1,4 +1,4 @@
-From 1c0e67ab2ef931f302eea7c01139b3d5d400222e Mon Sep 17 00:00:00 2001
+From b7de0dcc39f6c0a636b7118191e69f67d3205337 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 17:23:05 -0400
 Subject: [PATCH] Databases refuse edits that destroy property values
@@ -37,11 +37,11 @@ told the reason once it has connected again.
  kernel/model/attribute_view_fields.go         |   9 +
  kernel/model/attribute_view_option_undo.go    |   3 +
  kernel/model/attribute_view_property_guard.go | 442 ++++++++++++
- .../attribute_view_property_guard_test.go     | 657 ++++++++++++++++++
+ .../attribute_view_property_guard_test.go     | 641 ++++++++++++++++++
  kernel/model/block_operation.go               |   2 +-
  kernel/model/transaction.go                   |  11 +
  kernel/util/websocket.go                      |  53 ++
- 8 files changed, 1200 insertions(+), 7 deletions(-)
+ 8 files changed, 1184 insertions(+), 7 deletions(-)
  create mode 100644 kernel/model/attribute_view_property_guard.go
  create mode 100644 kernel/model/attribute_view_property_guard_test.go
 
@@ -626,10 +626,10 @@ index 0000000..c42bdfd
 +}
 diff --git a/kernel/model/attribute_view_property_guard_test.go b/kernel/model/attribute_view_property_guard_test.go
 new file mode 100644
-index 0000000..c86ff44
+index 0000000..8aa6246
 --- /dev/null
 +++ b/kernel/model/attribute_view_property_guard_test.go
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,641 @@
 +// SiYuan - From thought to insight, with agents
 +// Copyright (c) 2020-present, b3log.org
 +//
@@ -805,6 +805,16 @@ index 0000000..c86ff44
 +	return ret
 +}
 +
++// checkUnchanged fails the test if a database file differs from before, as a refused edit leaves them.
++func (f *propertyGuardFixture) checkUnchanged(t *testing.T, before [][]byte) {
++	t.Helper()
++	for i, data := range f.stored(t) {
++		if !bytes.Equal(before[i], data) {
++			t.Fatalf("a refused edit changed database [%s]", f.databases[i])
++		}
++	}
++}
++
 +func (f *propertyGuardFixture) key(t *testing.T, avID, keyID string) *av.Key {
 +	t.Helper()
 +	view, err := av.ParseAttributeView(avID)
@@ -815,11 +825,11 @@ index 0000000..c86ff44
 +	return key
 +}
 +
-+// emptyProperty adds a text field Priority to Tasks with this description, filled in on no row, as
++// emptyProperty adds a field to Tasks with this name, format and description, filled in on no row, as
 +// the field to edit.
-+func (f *propertyGuardFixture) emptyProperty(desc string) error {
++func (f *propertyGuardFixture) emptyProperty(name string, typ av.KeyType, desc string) error {
 +	f.scratch = ast.NewNodeID()
-+	if err := AddAttributeViewKey(f.tasks, "", f.scratch, "Priority", string(av.KeyTypeText), "", "", ""); nil != err {
++	if err := AddAttributeViewKey(f.tasks, "", f.scratch, name, string(typ), "", "", ""); nil != err {
 +		return err
 +	}
 +	return setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: f.scratch, Data: desc})
@@ -870,11 +880,7 @@ index 0000000..c86ff44
 +	if want := "The option 'blocked' wasn't removed from Status: 1 row uses it. Move the row to another option first."; nil == err || err.Error() != want {
 +		t.Fatalf("want the refusal\n  %s\ngot\n  %v", want, err)
 +	}
-+	for i, data := range f.stored(t) {
-+		if !bytes.Equal(before[i], data) {
-+			t.Fatalf("the refused undo changed database [%s]", f.databases[i])
-+		}
-+	}
++	f.checkUnchanged(t, before)
 +}
 +
 +func TestAttributeViewPropertyGuardRefusesEditsThatDestroyValues(t *testing.T) {
@@ -983,11 +989,7 @@ index 0000000..c86ff44
 +			if errors.As(err, &txErr) && TxErrCodeRefused != txErr.Code() {
 +				t.Fatalf("a refused transaction should reload the windows, got code %d", txErr.Code())
 +			}
-+			for i, data := range f.stored(t) {
-+				if !bytes.Equal(before[i], data) {
-+					t.Fatalf("the refused edit changed database [%s]", f.databases[i])
-+				}
-+			}
++			f.checkUnchanged(t, before)
 +			if nil == treenode.GetBlockTree(f.files.sourceID) || !f.files.box.Exist(f.files.sourcePath) {
 +				t.Fatal("the refused edit removed the page")
 +			}
@@ -997,7 +999,7 @@ index 0000000..c86ff44
 +
 +func TestAttributeViewPropertyGuardRefusesEditsOncePropertyHoldsAValue(t *testing.T) {
 +	f := setupPropertyGuardTest(t)
-+	if err := f.emptyProperty("key: prio"); nil != err {
++	if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +		t.Fatal(err)
 +	}
 +	if err := inEditor(&Operation{Action: "updateAttrViewCell", AvID: f.tasks, KeyID: f.scratch, RowID: f.renewal,
@@ -1005,7 +1007,7 @@ index 0000000..c86ff44
 +		t.Fatal(err)
 +	}
 +	before := f.stored(t)
-+	for _, edit := range []struct {
++	for _, c := range []struct {
 +		edit func() error
 +		want string
 +	}{
@@ -1019,15 +1021,11 @@ index 0000000..c86ff44
 +			return RemoveAttributeViewKey(f.tasks, f.scratch, false)
 +		}, "Priority wasn't deleted: it's a property, and deleting it would empty the Priority of every row in Tasks. Hide it from the view instead."},
 +	} {
-+		if err := edit.edit(); nil == err || err.Error() != edit.want {
-+			t.Fatalf("want the refusal\n  %s\ngot\n  %v", edit.want, err)
++		if err := c.edit(); nil == err || err.Error() != c.want {
++			t.Fatalf("want the refusal\n  %s\ngot\n  %v", c.want, err)
 +		}
 +	}
-+	for i, data := range f.stored(t) {
-+		if !bytes.Equal(before[i], data) {
-+			t.Fatalf("a refused edit changed database [%s]", f.databases[i])
-+		}
-+	}
++	f.checkUnchanged(t, before)
 +}
 +
 +func TestAttributeViewPropertyGuardKeepsTheTypeMarkOfADatabaseWithNoRows(t *testing.T) {
@@ -1040,11 +1038,7 @@ index 0000000..c86ff44
 +	if want := "Name's description wasn't changed: \"(type: person)\" says which Type People holds. Keep it and change the rest."; nil == err || err.Error() != want {
 +		t.Fatalf("want the refusal\n  %s\ngot\n  %v", want, err)
 +	}
-+	for i, data := range f.stored(t) {
-+		if !bytes.Equal(before[i], data) {
-+			t.Fatalf("the refused edit changed database [%s]", f.databases[i])
-+		}
-+	}
++	f.checkUnchanged(t, before)
 +}
 +
 +func TestAttributeViewPropertyGuardAllowsEditsThatLoseNothing(t *testing.T) {
@@ -1142,15 +1136,10 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"giving a relation property its first target", func(f *propertyGuardFixture) error {
-+			owner := ast.NewNodeID()
-+			if err := AddAttributeViewKey(f.tasks, "", owner, "Owner", string(av.KeyTypeRelation), "", "", ""); nil != err {
++			if err := f.emptyProperty("Owner", av.KeyTypeRelation, "key: owner"); nil != err {
 +				return err
 +			}
-+			if err := setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: owner, Data: "key: owner"}); nil != err {
-+				return err
-+			}
-+			f.scratch = owner
-+			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: owner, Format: "Owner"})
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: f.scratch, Format: "Owner"})
 +		}, func(t *testing.T, f *propertyGuardFixture) {
 +			if relation := f.key(t, f.tasks, f.scratch).Relation; nil == relation || f.people != relation.AvID {
 +				t.Fatalf("want Owner linking to People, got %+v", relation)
@@ -1181,7 +1170,7 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"fixing the key of a property no row fills", func(f *propertyGuardFixture) error {
-+			if err := f.emptyProperty("key: prio"); nil != err {
++			if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +				return err
 +			}
 +			return inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: "key: priority"})
@@ -1191,7 +1180,7 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"undoing adding a key to a field no row fills", func(f *propertyGuardFixture) error {
-+			if err := f.emptyProperty("key: prio"); nil != err {
++			if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +				return err
 +			}
 +			added := &Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: "key: prio"}
@@ -1202,7 +1191,7 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"changing the format of a property no row fills", func(f *propertyGuardFixture) error {
-+			if err := f.emptyProperty("key: prio"); nil != err {
++			if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +				return err
 +			}
 +			return UpdateAttributeViewKeyConfig(f.tasks, f.scratch, map[string]any{"type": "number"})
@@ -1212,7 +1201,7 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"deleting a property no row fills", func(f *propertyGuardFixture) error {
-+			if err := f.emptyProperty("key: prio"); nil != err {
++			if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +				return err
 +			}
 +			return inEditor(&Operation{Action: "removeAttrViewCol", AvID: f.tasks, ID: f.scratch})
@@ -1223,7 +1212,7 @@ index 0000000..c86ff44
 +		}},
 +		{"deleting a property only an unlisted item fills", func(f *propertyGuardFixture) error {
 +			// A value a deleted page left behind belongs to no row, so nothing is lost.
-+			if err := f.emptyProperty("key: prio"); nil != err {
++			if err := f.emptyProperty("Priority", av.KeyTypeText, "key: prio"); nil != err {
 +				return err
 +			}
 +			view, err := av.ParseAttributeView(f.tasks)
@@ -1244,18 +1233,13 @@ index 0000000..c86ff44
 +			}
 +		}},
 +		{"pointing a relation property no row fills at another database", func(f *propertyGuardFixture) error {
-+			owner := ast.NewNodeID()
-+			f.scratch = owner
-+			if err := AddAttributeViewKey(f.tasks, "", owner, "Owner", string(av.KeyTypeRelation), "", "", ""); nil != err {
++			if err := f.emptyProperty("Owner", av.KeyTypeRelation, "key: owner"); nil != err {
 +				return err
 +			}
-+			if err := setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: owner, Data: "key: owner"}); nil != err {
++			if err := updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: f.scratch, Format: "Owner"}); nil != err {
 +				return err
 +			}
-+			if err := updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: owner, Format: "Owner"}); nil != err {
-+				return err
-+			}
-+			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.projects, KeyID: owner, Format: "Owner"})
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.projects, KeyID: f.scratch, Format: "Owner"})
 +		}, func(t *testing.T, f *propertyGuardFixture) {
 +			if relation := f.key(t, f.tasks, f.scratch).Relation; nil == relation || f.projects != relation.AvID {
 +				t.Fatalf("want Owner linking to Projects, got %+v", relation)

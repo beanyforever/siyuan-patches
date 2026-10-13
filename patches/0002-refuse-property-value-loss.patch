@@ -1,4 +1,4 @@
-From 1933fd1e80e044602a5056c9bfa89a3836b75b91 Mon Sep 17 00:00:00 2001
+From 1c0e67ab2ef931f302eea7c01139b3d5d400222e Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 17:23:05 -0400
 Subject: [PATCH] Databases refuse edits that destroy property values
@@ -6,23 +6,26 @@ Subject: [PATCH] Databases refuse edits that destroy property values
 A property is a database field whose description starts with "key: <key>",
 which says what the field means whatever its name. Some edits to one destroy the
 values its rows hold, and SiYuan made them in the editor, over /api/av/* and
-through the MCP database tool without a word. They are now refused before
-anything changes: deleting a property, or a field whose two-way partner is a
-property when the partner goes with it; changing a property's format; removing
-or changing the key in its description, or the Type mark "(type: ...)" on a
-primary field's; changing what a relation property links to, or whether and
-with which field it is two-way, once it has a target; and removing or renaming
-an option that rows of the database still use, on any property. Deleting a page
-through a block deletion was refused only by /api/block/deleteBlock; it is now
-refused on every way in, with a message saying to delete it from the tree.
+through the MCP database tool without a word. While a row of the database holds
+a value in the property, they are now refused before anything changes: deleting
+it, or a field whose two-way partner is such a property when the partner goes
+with it; changing its format; removing or changing the key in its description;
+changing what a relation property links to, or whether and with which field it
+is two-way; and removing or renaming an option that rows of the database still
+use. The Type mark "(type: ...)" on a primary field's description is kept
+whatever the rows hold, since it says which Type the database holds. Deleting a
+page through a block deletion was refused only by /api/block/deleteBlock; it is
+now refused on every way in, with a message saying to delete it from the tree.
 
 Everything else passes: renaming a property, adding, reordering and recolouring
 options, removing or renaming an unused one, display formats, adding a key or a
 Type mark, a relation's first target, and any edit to a field without a key. A
-keyed field holding no values while another field carries the same key is a
-copy, as "Duplicate" makes, so undoing the duplicate still works. The editor
-undoes "add option" by removing the option, which also clears the rows the same
-edit picked it on, so an undo may clear those rows, though no others.
+property no row fills in yet loses nothing, so it is left alone too: a key just
+typed can be fixed or undone, the field's format changed or the field deleted,
+and a copy "Duplicate" made, which carries the key but no values, is deleted
+like any other. The editor undoes "add option" by removing the option, which
+also clears the rows the same edit picked it on, so an undo may clear those
+rows, though no others.
 
 The checks sit in the shared functions every way in reaches, and the
 transaction path also checks a whole transaction before applying any of it.
@@ -33,12 +36,12 @@ told the reason once it has connected again.
  kernel/model/attribute_view.go                |  30 +-
  kernel/model/attribute_view_fields.go         |   9 +
  kernel/model/attribute_view_option_undo.go    |   3 +
- kernel/model/attribute_view_property_guard.go | 447 +++++++++++++++
- .../attribute_view_property_guard_test.go     | 508 ++++++++++++++++++
+ kernel/model/attribute_view_property_guard.go | 442 ++++++++++++
+ .../attribute_view_property_guard_test.go     | 657 ++++++++++++++++++
  kernel/model/block_operation.go               |   2 +-
  kernel/model/transaction.go                   |  11 +
  kernel/util/websocket.go                      |  53 ++
- 8 files changed, 1056 insertions(+), 7 deletions(-)
+ 8 files changed, 1200 insertions(+), 7 deletions(-)
  create mode 100644 kernel/model/attribute_view_property_guard.go
  create mode 100644 kernel/model/attribute_view_property_guard_test.go
 
@@ -175,10 +178,10 @@ index 7386b5f..4a4d05e 100644
  	views := map[string]*av.AttributeView{source.ID: source}
 diff --git a/kernel/model/attribute_view_property_guard.go b/kernel/model/attribute_view_property_guard.go
 new file mode 100644
-index 0000000..d18c36d
+index 0000000..c42bdfd
 --- /dev/null
 +++ b/kernel/model/attribute_view_property_guard.go
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,442 @@
 +// SiYuan - From thought to insight, with agents
 +// Copyright (c) 2020-present, b3log.org
 +//
@@ -212,7 +215,9 @@ index 0000000..d18c36d
 +// Edits that would destroy the values a database property holds are refused before anything
 +// changes. A property is a field whose description starts with "key: <key>": the key says what the
 +// field means across databases, so views, rules and fixes find the field by it, whatever its name.
-+// A field without a key is outside the schema and left alone. The checks run in the shared
++// A field without a key is outside the schema and left alone, and so is a property no row fills in
++// yet, since an edit to it loses nothing; a primary field's Type mark is kept whatever the rows
++// hold, since it says which Type the database holds. The checks run in the shared
 +// functions every way in reaches: the editor and /api/transactions through the transaction path,
 +// which also checks a whole transaction before applying any of it, and /api/av/*, the MCP
 +// database tool and the CLI directly. A refused edit leaves the database as it was and returns the
@@ -257,20 +262,13 @@ index 0000000..d18c36d
 +	return key
 +}
 +
-+// isAttributeViewProperty reports whether a field is a property. A field that holds no values
-+// while another field of the database carries the same key is a copy, such as "Duplicate" makes,
-+// and is left alone like a field outside the schema, so undoing the duplicate still works.
-+func isAttributeViewProperty(attrView *av.AttributeView, key *av.Key) bool {
-+	propertyKey := attributeViewPropertyKey(key.Desc)
-+	if "" == propertyKey {
-+		return false
-+	}
-+	for _, kv := range attrView.KeyValues {
-+		if kv.Key.ID != key.ID && attributeViewPropertyKey(kv.Key.Desc) == propertyKey {
-+			return attributeViewFieldHoldsValues(attrView, key)
-+		}
-+	}
-+	return true
++// isGuardedAttributeViewProperty reports whether a field is a property holding values that an edit
++// could destroy: its description carries a key, and a row the database lists holds a value in it. A
++// property no row fills in yet, such as one just added or a copy "Duplicate" made, loses nothing, so
++// it is left alone like a field outside the schema: its key can be fixed, an edit undone, the field
++// deleted.
++func isGuardedAttributeViewProperty(attrView *av.AttributeView, key *av.Key) bool {
++	return "" != attributeViewPropertyKey(key.Desc) && attributeViewFieldHoldsValues(attrView, key)
 +}
 +
 +// attributeViewListedItems are the rows a database lists. A value stored for any other item, such
@@ -370,7 +368,7 @@ index 0000000..d18c36d
 +// checkAttributeViewFieldRemoval refuses deleting a property, and deleting a field whose two-way
 +// partner is a property when the partner would be deleted with it.
 +func checkAttributeViewFieldRemoval(attrView *av.AttributeView, key *av.Key, removeDest bool, load attributeViewLoader) error {
-+	if isAttributeViewProperty(attrView, key) {
++	if isGuardedAttributeViewProperty(attrView, key) {
 +		return refuseAttributeViewEdit("%s wasn't deleted: it's a property, and deleting it would empty the %s of every row in %s. Hide it from the view instead.",
 +			attributeViewFieldLabel(key), attributeViewFieldLabel(key), attributeViewLabel(attrView))
 +	}
@@ -384,7 +382,7 @@ index 0000000..d18c36d
 +	}
 +	back, _ := dest.GetKey(relation.BackKeyID)
 +	if nil == back || av.KeyTypeRelation != back.Type || nil == back.Relation || back.Relation.AvID != attrView.ID ||
-+		!back.Relation.IsTwoWay || back.Relation.BackKeyID != key.ID || !isAttributeViewProperty(dest, back) {
++		!back.Relation.IsTwoWay || back.Relation.BackKeyID != key.ID || !isGuardedAttributeViewProperty(dest, back) {
 +		return nil
 +	}
 +	return refuseAttributeViewEdit("%s wasn't deleted: its pair, %s in %s, is a property and would be deleted with it, emptying it on every row. Delete %s alone, keeping %s, or hide it from the view instead.",
@@ -393,7 +391,7 @@ index 0000000..d18c36d
 +
 +// checkAttributeViewFieldFormat refuses changing a property's format. A rename passes.
 +func checkAttributeViewFieldFormat(attrView *av.AttributeView, key *av.Key, keyType av.KeyType) error {
-+	if key.Type == keyType || !isAttributeViewProperty(attrView, key) {
++	if key.Type == keyType || !isGuardedAttributeViewProperty(attrView, key) {
 +		return nil
 +	}
 +	return refuseAttributeViewEdit("%s's format wasn't changed: it's a property, and its values in %s would stop meaning what they mean. Add a new field with that format instead.",
@@ -404,7 +402,7 @@ index 0000000..d18c36d
 +// a primary field. Adding either to a field without one passes, and so does any other text.
 +func checkAttributeViewFieldDesc(attrView *av.AttributeView, key *av.Key, desc string) error {
 +	if oldKey := attributeViewPropertyKey(key.Desc); "" != oldKey && attributeViewPropertyKey(desc) != oldKey &&
-+		isAttributeViewProperty(attrView, key) {
++		isGuardedAttributeViewProperty(attrView, key) {
 +		return refuseAttributeViewEdit("%s's description wasn't changed: \"%s%s\" marks it as a property, and every view and rule relies on it. Keep it at the start and put any other text after a space.",
 +			attributeViewFieldLabel(key), attributeViewPropertyKeyPrefix, oldKey)
 +	}
@@ -432,7 +430,7 @@ index 0000000..d18c36d
 +		backKeyID = operation.BackRelationKeyID
 +	}
 +	relation := key.Relation
-+	if nil != relation && "" != relation.AvID && isAttributeViewProperty(srcAv, key) &&
++	if nil != relation && "" != relation.AvID && isGuardedAttributeViewProperty(srcAv, key) &&
 +		(relation.AvID != operation.ID || relation.IsTwoWay != operation.IsTwoWay || relation.BackKeyID != backKeyID) {
 +		return attributeViewRelationRefusal(srcAv, key, false, load)
 +	}
@@ -441,7 +439,7 @@ index 0000000..d18c36d
 +		if oldDest := load(relation.AvID); nil != oldDest {
 +			oldBack, _ := oldDest.GetKey(relation.BackKeyID)
 +			if nil != oldBack && nil != oldBack.Relation && oldBack.Relation.AvID == srcAv.ID && oldBack.Relation.IsTwoWay &&
-+				isAttributeViewProperty(oldDest, oldBack) {
++				isGuardedAttributeViewProperty(oldDest, oldBack) {
 +				return attributeViewRelationRefusal(oldDest, oldBack, true, load)
 +			}
 +		}
@@ -454,7 +452,7 @@ index 0000000..d18c36d
 +		return nil
 +	}
 +	back, _ := dest.GetKey(operation.BackRelationKeyID)
-+	if nil == back || nil == back.Relation || "" == back.Relation.AvID || !isAttributeViewProperty(dest, back) {
++	if nil == back || nil == back.Relation || "" == back.Relation.AvID || !isGuardedAttributeViewProperty(dest, back) {
 +		return nil
 +	}
 +	pairedWith := ""
@@ -487,7 +485,7 @@ index 0000000..d18c36d
 +// use, other than the rows in except. Renaming onto an existing option, which merges the two, is a
 +// rename.
 +func checkAttributeViewOptionChange(attrView *av.AttributeView, key *av.Key, operation *Operation, remove bool, except map[string]bool) error {
-+	if !isAttributeViewProperty(attrView, key) {
++	if !isGuardedAttributeViewProperty(attrView, key) {
 +		return nil
 +	}
 +	var oldName string
@@ -628,10 +626,10 @@ index 0000000..d18c36d
 +}
 diff --git a/kernel/model/attribute_view_property_guard_test.go b/kernel/model/attribute_view_property_guard_test.go
 new file mode 100644
-index 0000000..e1d001e
+index 0000000..c86ff44
 --- /dev/null
 +++ b/kernel/model/attribute_view_property_guard_test.go
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,657 @@
 +// SiYuan - From thought to insight, with agents
 +// Copyright (c) 2020-present, b3log.org
 +//
@@ -776,6 +774,12 @@ index 0000000..e1d001e
 +	taskValues, _ := projects.GetKeyValues(f.projectTasks)
 +	taskValues.Values = []*av.Value{{ID: ast.NewNodeID(), KeyID: f.projectTasks, BlockID: project, Type: av.KeyTypeRelation,
 +		Relation: &av.ValueRelation{BlockIDs: []string{f.renewal}}}}
++	seeAlsoValues, _ := tasks.GetKeyValues(f.seeAlso)
++	seeAlsoValues.Values = []*av.Value{{ID: ast.NewNodeID(), KeyID: f.seeAlso, BlockID: f.gardening, Type: av.KeyTypeRelation,
++		Relation: &av.ValueRelation{BlockIDs: []string{project}}}}
++	mentionValues, _ := projects.GetKeyValues(f.mentions)
++	mentionValues.Values = []*av.Value{{ID: ast.NewNodeID(), KeyID: f.mentions, BlockID: project, Type: av.KeyTypeRelation,
++		Relation: &av.ValueRelation{BlockIDs: []string{f.gardening}}}}
 +
 +	for _, view := range []*av.AttributeView{tasks, projects, people} {
 +		if err := av.SaveAttributeView(view); nil != err {
@@ -809,6 +813,16 @@ index 0000000..e1d001e
 +	}
 +	key, _ := view.GetKey(keyID)
 +	return key
++}
++
++// emptyProperty adds a text field Priority to Tasks with this description, filled in on no row, as
++// the field to edit.
++func (f *propertyGuardFixture) emptyProperty(desc string) error {
++	f.scratch = ast.NewNodeID()
++	if err := AddAttributeViewKey(f.tasks, "", f.scratch, "Priority", string(av.KeyTypeText), "", "", ""); nil != err {
++		return err
++	}
++	return setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: f.scratch, Data: desc})
 +}
 +
 +func optionNames(key *av.Key) (ret []string) {
@@ -981,6 +995,58 @@ index 0000000..e1d001e
 +	}
 +}
 +
++func TestAttributeViewPropertyGuardRefusesEditsOncePropertyHoldsAValue(t *testing.T) {
++	f := setupPropertyGuardTest(t)
++	if err := f.emptyProperty("key: prio"); nil != err {
++		t.Fatal(err)
++	}
++	if err := inEditor(&Operation{Action: "updateAttrViewCell", AvID: f.tasks, KeyID: f.scratch, RowID: f.renewal,
++		Data: map[string]any{"text": map[string]any{"content": "high"}}}); nil != err {
++		t.Fatal(err)
++	}
++	before := f.stored(t)
++	for _, edit := range []struct {
++		edit func() error
++		want string
++	}{
++		{func() error {
++			return inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: "key: priority"})
++		}, "Priority's description wasn't changed: \"key: prio\" marks it as a property, and every view and rule relies on it. Keep it at the start and put any other text after a space."},
++		{func() error {
++			return UpdateAttributeViewKeyConfig(f.tasks, f.scratch, map[string]any{"type": "number"})
++		}, "Priority's format wasn't changed: it's a property, and its values in Tasks would stop meaning what they mean. Add a new field with that format instead."},
++		{func() error {
++			return RemoveAttributeViewKey(f.tasks, f.scratch, false)
++		}, "Priority wasn't deleted: it's a property, and deleting it would empty the Priority of every row in Tasks. Hide it from the view instead."},
++	} {
++		if err := edit.edit(); nil == err || err.Error() != edit.want {
++			t.Fatalf("want the refusal\n  %s\ngot\n  %v", edit.want, err)
++		}
++	}
++	for i, data := range f.stored(t) {
++		if !bytes.Equal(before[i], data) {
++			t.Fatalf("a refused edit changed database [%s]", f.databases[i])
++		}
++	}
++}
++
++func TestAttributeViewPropertyGuardKeepsTheTypeMarkOfADatabaseWithNoRows(t *testing.T) {
++	f := setupPropertyGuardTest(t)
++	if err := setAttributeViewColDesc(&Operation{AvID: f.people, ID: f.peopleName, Data: "key: name (type: person)"}); nil != err {
++		t.Fatal(err)
++	}
++	before := f.stored(t)
++	err := inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.people, ID: f.peopleName, Data: "key: name"})
++	if want := "Name's description wasn't changed: \"(type: person)\" says which Type People holds. Keep it and change the rest."; nil == err || err.Error() != want {
++		t.Fatalf("want the refusal\n  %s\ngot\n  %v", want, err)
++	}
++	for i, data := range f.stored(t) {
++		if !bytes.Equal(before[i], data) {
++			t.Fatalf("the refused edit changed database [%s]", f.databases[i])
++		}
++	}
++}
++
 +func TestAttributeViewPropertyGuardAllowsEditsThatLoseNothing(t *testing.T) {
 +	cases := []struct {
 +		name  string
@@ -1112,6 +1178,87 @@ index 0000000..e1d001e
 +		}, func(t *testing.T, f *propertyGuardFixture) {
 +			if nil != f.key(t, f.tasks, f.scratch) || nil == f.key(t, f.tasks, f.status) {
 +				t.Fatal("want the copy gone and Status kept")
++			}
++		}},
++		{"fixing the key of a property no row fills", func(f *propertyGuardFixture) error {
++			if err := f.emptyProperty("key: prio"); nil != err {
++				return err
++			}
++			return inEditor(&Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: "key: priority"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if desc := f.key(t, f.tasks, f.scratch).Desc; "key: priority" != desc {
++				t.Fatalf("want the key fixed, got %q", desc)
++			}
++		}},
++		{"undoing adding a key to a field no row fills", func(f *propertyGuardFixture) error {
++			if err := f.emptyProperty("key: prio"); nil != err {
++				return err
++			}
++			added := &Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: "key: prio"}
++			return undoing([]*Operation{added}, &Operation{Action: "setAttrViewColDesc", AvID: f.tasks, ID: f.scratch, Data: ""})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if desc := f.key(t, f.tasks, f.scratch).Desc; "" != desc {
++				t.Fatalf("want the key gone, got %q", desc)
++			}
++		}},
++		{"changing the format of a property no row fills", func(f *propertyGuardFixture) error {
++			if err := f.emptyProperty("key: prio"); nil != err {
++				return err
++			}
++			return UpdateAttributeViewKeyConfig(f.tasks, f.scratch, map[string]any{"type": "number"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if typ := f.key(t, f.tasks, f.scratch).Type; av.KeyTypeNumber != typ {
++				t.Fatalf("want Priority a number, got a %s", typ)
++			}
++		}},
++		{"deleting a property no row fills", func(f *propertyGuardFixture) error {
++			if err := f.emptyProperty("key: prio"); nil != err {
++				return err
++			}
++			return inEditor(&Operation{Action: "removeAttrViewCol", AvID: f.tasks, ID: f.scratch})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if key := f.key(t, f.tasks, f.scratch); nil != key {
++				t.Fatalf("want Priority gone, got %s", key.Name)
++			}
++		}},
++		{"deleting a property only an unlisted item fills", func(f *propertyGuardFixture) error {
++			// A value a deleted page left behind belongs to no row, so nothing is lost.
++			if err := f.emptyProperty("key: prio"); nil != err {
++				return err
++			}
++			view, err := av.ParseAttributeView(f.tasks)
++			if nil != err {
++				return err
++			}
++			kv, _ := view.GetKeyValues(f.scratch)
++			kv.Values = append(kv.Values, &av.Value{ID: ast.NewNodeID(), KeyID: f.scratch, BlockID: ast.NewNodeID(),
++				Type: av.KeyTypeText, Text: &av.ValueText{Content: "high"}})
++			if err = av.SaveAttributeView(view); nil != err {
++				return err
++			}
++			cache.ClearAVCache()
++			return RemoveAttributeViewKey(f.tasks, f.scratch, false)
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if key := f.key(t, f.tasks, f.scratch); nil != key {
++				t.Fatalf("want Priority gone, got %s", key.Name)
++			}
++		}},
++		{"pointing a relation property no row fills at another database", func(f *propertyGuardFixture) error {
++			owner := ast.NewNodeID()
++			f.scratch = owner
++			if err := AddAttributeViewKey(f.tasks, "", owner, "Owner", string(av.KeyTypeRelation), "", "", ""); nil != err {
++				return err
++			}
++			if err := setAttributeViewColDesc(&Operation{AvID: f.tasks, ID: owner, Data: "key: owner"}); nil != err {
++				return err
++			}
++			if err := updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.people, KeyID: owner, Format: "Owner"}); nil != err {
++				return err
++			}
++			return updateAttributeViewColRelation(&Operation{AvID: f.tasks, ID: f.projects, KeyID: owner, Format: "Owner"})
++		}, func(t *testing.T, f *propertyGuardFixture) {
++			if relation := f.key(t, f.tasks, f.scratch).Relation; nil == relation || f.projects != relation.AvID {
++				t.Fatalf("want Owner linking to Projects, got %+v", relation)
 +			}
 +		}},
 +		{"deleting a field outside the schema", func(f *propertyGuardFixture) error {

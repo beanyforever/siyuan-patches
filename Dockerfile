@@ -1,6 +1,6 @@
 # SiYuan's official image with its kernel rebuilt from the same release plus patches/.
 # The kernel build matches upstream's Dockerfile; the front end is reused unchanged.
-ARG SIYUAN_VERSION=v3.8.6
+ARG SIYUAN_VERSION=v3.8.7
 
 FROM golang:1.26-alpine AS kernel
 ARG SIYUAN_VERSION

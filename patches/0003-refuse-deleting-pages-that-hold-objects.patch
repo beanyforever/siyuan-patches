@@ -1,4 +1,4 @@
-From c9d385ea02824698391093500386cc9368793250 Mon Sep 17 00:00:00 2001
+From fb2044bf39f81f271d2fac75a65a8d963c4072e5 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 20:51:37 -0400
 Subject: [PATCH] Deleting a page or a notebook that holds a Type's pages is
@@ -23,17 +23,17 @@ around them.
 ---
  kernel/model/file.go                   |   8 ++
  kernel/model/mount.go                  |   3 +
- kernel/model/system_page_guard.go      |  86 ++++++++++++++++++
+ kernel/model/system_page_guard.go      |  87 ++++++++++++++++++
  kernel/model/system_page_guard_test.go | 121 +++++++++++++++++++++++++
- 4 files changed, 218 insertions(+)
+ 4 files changed, 219 insertions(+)
  create mode 100644 kernel/model/system_page_guard.go
  create mode 100644 kernel/model/system_page_guard_test.go
 
 diff --git a/kernel/model/file.go b/kernel/model/file.go
-index 5ef8161..57668a6 100644
+index 4915ec1..3c24d7f 100644
 --- a/kernel/model/file.go
 +++ b/kernel/model/file.go
-@@ -2017,6 +2017,9 @@ func RemoveDoc(boxID, p string) error {
+@@ -2025,6 +2025,9 @@ func RemoveDoc(boxID, p string) error {
  	if IsBoxDocPath(boxID, p) {
  		return errors.New(Conf.Language(341))
  	}
@@ -43,7 +43,7 @@ index 5ef8161..57668a6 100644
  
  	FlushTxQueue()
  	luteEngine := util.NewLute()
-@@ -2044,6 +2047,11 @@ func RemoveDocs(paths []string) error {
+@@ -2052,6 +2055,11 @@ func RemoveDocs(paths []string) error {
  		if nil != box && IsBoxDocPath(box.ID, p) {
  			return errors.New(Conf.Language(341))
  		}
@@ -56,10 +56,10 @@ index 5ef8161..57668a6 100644
  	FlushTxQueue()
  	luteEngine := util.NewLute()
 diff --git a/kernel/model/mount.go b/kernel/model/mount.go
-index fabf5b5..10c588a 100644
+index 6961d9c..300d18e 100644
 --- a/kernel/model/mount.go
 +++ b/kernel/model/mount.go
-@@ -277,6 +277,9 @@ func RemoveBox(boxID string) (err error) {
+@@ -280,6 +280,9 @@ func RemoveBox(boxID string) (err error) {
  	if util.IsReservedFilename(boxID) {
  		return fmt.Errorf("can not remove [%s] caused by it is a reserved file", boxID)
  	}
@@ -71,10 +71,10 @@ index fabf5b5..10c588a 100644
  	sql.FlushQueue()
 diff --git a/kernel/model/system_page_guard.go b/kernel/model/system_page_guard.go
 new file mode 100644
-index 0000000..26e8182
+index 0000000..ca990dd
 --- /dev/null
 +++ b/kernel/model/system_page_guard.go
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,87 @@
 +// SiYuan - From thought to insight, with agents
 +// Copyright (c) 2020-present, b3log.org
 +//
@@ -114,7 +114,8 @@ index 0000000..26e8182
 +
 +// systemPageDeletionRefusal refuses deleting a system page while pages sit under it.
 +func systemPageDeletionRefusal(box *Box, p string) error {
-+	ial := filesys.DocIAL(filepath.Join(util.DataDir, box.ID, p))
++	// A page whose attributes can't be read isn't taken for a system page.
++	ial, _ := filesys.DocIAL(filepath.Join(util.DataDir, box.ID, p))
 +	if systemPageType != ial["custom-object-type"] {
 +		return nil
 +	}
@@ -148,7 +149,7 @@ index 0000000..26e8182
 +			return filepath.SkipDir
 +		}
 +		if !entry.IsDir() && strings.HasSuffix(path, ".sy") {
-+			if ial := filesys.DocIAL(path); systemPageType == ial["custom-object-type"] {
++			if ial, _ := filesys.DocIAL(path); systemPageType == ial["custom-object-type"] {
 +				held = ial["title"]
 +				return filepath.SkipAll
 +			}

@@ -1,4 +1,4 @@
-From 27cd24a27f79434b0894dcd803f6bba87e563995 Mon Sep 17 00:00:00 2001
+From 3004076eda24f28051d50772da87860fa67deebf Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 14:30:33 -0400
 Subject: [PATCH] MCP server sends the custom instructions as its instructions
@@ -14,7 +14,7 @@ from the next connection, and a missing or blank file still sends no field.
  2 files changed, 87 insertions(+), 1 deletion(-)
 
 diff --git a/kernel/mcp/server.go b/kernel/mcp/server.go
-index 0524855..9270ecc 100644
+index 751e69f..5d28b3b 100644
 --- a/kernel/mcp/server.go
 +++ b/kernel/mcp/server.go
 @@ -22,6 +22,7 @@ import (
@@ -25,7 +25,7 @@ index 0524855..9270ecc 100644
  	"sync"
  
  	"github.com/gin-gonic/gin"
-@@ -156,10 +157,40 @@ func newServer() *mcpsdk.Server {
+@@ -158,10 +159,40 @@ func newServer() *mcpsdk.Server {
  	}, &mcpsdk.ServerOptions{
  		Capabilities: &mcpsdk.ServerCapabilities{},
  	})
@@ -68,10 +68,10 @@ index 0524855..9270ecc 100644
  	return func(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
  		return func(ctx context.Context, method string, request mcpsdk.Request) (mcpsdk.Result, error) {
 diff --git a/kernel/mcp/server_test.go b/kernel/mcp/server_test.go
-index f40f85c..2eb3232 100644
+index c954dc4..072b5aa 100644
 --- a/kernel/mcp/server_test.go
 +++ b/kernel/mcp/server_test.go
-@@ -624,6 +624,61 @@ func TestLegacyProtocolSession(t *testing.T) {
+@@ -672,6 +672,61 @@ func TestLegacyProtocolSession(t *testing.T) {
  	}
  }
  

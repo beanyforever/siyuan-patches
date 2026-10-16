@@ -1,0 +1,164 @@
+From 442c29aa044ae43b444f67c3ab28583fec2199c6 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 07:46:32 -0400
+Subject: [PATCH] The attribute caches keep the attributes put last, however
+ close the puts
+
+SiYuan keeps blocks' and documents' attributes in two ristretto caches.
+ristretto takes in a key it doesn't hold yet later, on its own goroutine, and
+turns away a second put of that key queued before the first is taken in, as
+one it already holds. So when two puts of a new key came close together, the
+cache kept the first.
+
+"+ New" in a database does this to the page it makes. Inserting the row,
+fillDefaultValue renders the view to find the row next to it
+(getAttrViewAddingBlockDefaultValues, getNearItem), which reads the new page's
+attributes from its file and puts them in the cache (BatchGetBlockAttrs,
+getBlockAttrsFromTree), before the page is bound. A fraction of a millisecond
+later, bindBlockAv0 binds it and puts its attributes again, with custom-avs
+(setNodeAttrsWithTx). About 1 time in 3 to 6 the second put was turned away,
+and the cache kept the page's attributes without custom-avs until SiYuan
+restarted or they were put again. /api/attr/getBlockAttrs then lacked
+custom-avs, and /api/av/getAttributeViewKeys, which starts from it, listed no
+database for the page, though the database, the page's file and SQL all held
+the binding.
+
+A put to either cache now returns once the cache holds its attributes, and
+puts to one cache take turns, so a read after a put gives what was put.
+SiYuan's tree and database caches already guard against the same ristretto
+behaviour, with a generation per key.
+---
+ kernel/cache/ial.go             |  4 +--
+ kernel/cache/ial_latest.go      | 37 +++++++++++++++++++++++
+ kernel/cache/ial_latest_test.go | 53 +++++++++++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+), 2 deletions(-)
+ create mode 100644 kernel/cache/ial_latest.go
+ create mode 100644 kernel/cache/ial_latest_test.go
+
+diff --git a/kernel/cache/ial.go b/kernel/cache/ial.go
+index de41b2f..76d5b4e 100644
+--- a/kernel/cache/ial.go
++++ b/kernel/cache/ial.go
+@@ -51,7 +51,7 @@ func PutDocIALInBox(p, boxID string, ial map[string]string) {
+ 		RemoveDocIALInBox(p, boxID)
+ 		return
+ 	}
+-	docIALCache.Set(key, maps.Clone(ial), cost)
++	putLatestIAL(docIALCache, &docIALPutMu, key, maps.Clone(ial), cost)
+ 
+ 	docIALCacheKeysMu.Lock()
+ 	defer docIALCacheKeysMu.Unlock()
+@@ -130,7 +130,7 @@ func PutBlockIALInBox(id, boxID string, ial map[string]string) {
+ 		RemoveBlockIALInBox(id, boxID)
+ 		return
+ 	}
+-	blockIALCache.Set(key, maps.Clone(ial), cost)
++	putLatestIAL(blockIALCache, &blockIALPutMu, key, maps.Clone(ial), cost)
+ 
+ 	blockIALCacheKeysMu.Lock()
+ 	defer blockIALCacheKeysMu.Unlock()
+diff --git a/kernel/cache/ial_latest.go b/kernel/cache/ial_latest.go
+new file mode 100644
+index 0000000..f83e98a
+--- /dev/null
++++ b/kernel/cache/ial_latest.go
+@@ -0,0 +1,37 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"sync"
++
++	"github.com/dgraph-io/ristretto"
++)
++
++var blockIALPutMu, docIALPutMu sync.Mutex
++
++// putLatestIAL puts attributes in an attribute cache and returns once the cache holds them. ristretto takes in a key
++// it doesn't hold yet later, on its own goroutine, and turns away a second put of that key queued before the first is
++// taken in, as one it already holds; without waiting, the first put's attributes would stay, and a page made a row
++// just after it is made would read as bound to no database. Puts to one cache take turns, so a put queued after
++// another's is never turned away.
++func putLatestIAL(c *ristretto.Cache, mu *sync.Mutex, key string, ial map[string]string, cost int64) {
++	mu.Lock()
++	defer mu.Unlock()
++	c.Set(key, ial, cost)
++	c.Wait()
++}
+diff --git a/kernel/cache/ial_latest_test.go b/kernel/cache/ial_latest_test.go
+new file mode 100644
+index 0000000..253b5f2
+--- /dev/null
++++ b/kernel/cache/ial_latest_test.go
+@@ -0,0 +1,53 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"fmt"
++	"testing"
++)
++
++// Two puts of a block's or a document's attributes back to back, the second before the cache has taken in the first,
++// as making a row with "+ New" does: once both have returned, a read gives the second. ristretto queues a put of a key
++// it doesn't hold yet, and then turns away a second put of that key as one it already holds, so without waiting the
++// read gives the first put's attributes, here a page's from before it was bound to its row.
++func TestIALCacheKeepsLatestPut(t *testing.T) {
++	cases := []struct {
++		name  string
++		put   func(id, boxID string, ial map[string]string)
++		get   func(id, boxID string) map[string]string
++		wait  func()
++		clear func()
++	}{
++		{"block", PutBlockIALInBox, GetBlockIALInBox, blockIALCache.Wait, ClearBlocksIAL},
++		{"document", PutDocIALInBox, GetDocIALInBox, docIALCache.Wait, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			t.Cleanup(c.clear)
++			for i := range 100 {
++				id := fmt.Sprintf("20261016090000-latest%d", i)
++				c.put(id, "box", map[string]string{"id": id})
++				c.put(id, "box", map[string]string{"id": id, "custom-avs": "20261016090000-database"})
++				c.wait() // whatever the cache still has queued, it has now taken in
++				if got := c.get(id, "box"); got["custom-avs"] != "20261016090000-database" {
++					t.Fatalf("after two puts of %s, a read gave %v, not the second put's attributes", id, got)
++				}
++			}
++		})
++	}
++}
+-- 
+2.53.0
+

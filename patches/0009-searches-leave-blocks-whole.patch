@@ -1,0 +1,336 @@
+From 2910b4136ae6c10c1aed70eef805f292fa4f2661 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 09:40:23 -0400
+Subject: [PATCH] A search leaves the blocks it finds reading whole
+
+Three searches read their rows from blocks_fts with snippet() or
+highlight() in place of the block's fields: the full-text search's FTS
+route (fullTextSearchByFTSInBox, which a keyword search takes when it
+doesn't search paths and a query-syntax search always takes), the
+block-ref search typed after (( (fullTextSearchRefBlockInBox), and the
+highlighting of a page opened from a search (highlightByFTSInBox). Their
+rows went through scanBlockRows, which stores every row in SQL's block
+cache, stripping search marks from Content only. GetBlock and GetBlocks read
+that cache first, so until the block changed or the cache was cleared, a
+found block read cut to its snippet, or with search marks in its name,
+alias, memo, tag or attributes, wherever SiYuan reads a block by id: ref
+text in exports and templates, and the backlinks panel, among them.
+
+The two routes those searches use, SelectBlocksRawStmtArgsInBox and
+SelectBlocksRawStmtNoParseInBox, get NoCache twins that scan rows without
+storing them, through scanBlockRowsNoCache, and the three searches use
+them. Results are built from the rows returned, so nothing they show
+changes. Every other read of blocks caches as before; the default keyword
+search with paths, and multi-word searches, already read rows as maps.
+
+Its Go test is TestSearchLeavesBlocksWhole, in search_cache_fts5_test.go,
+on a page holding a paragraph of 7,896 characters named "needle list": a
+keyword search without paths, a query-syntax search, a block-ref search,
+and opening the page with the query needle, then GetBlock of the page and
+the paragraph. Without the patch, on v3.8.7 with 0001 to 0008 applied, the
+first two left the paragraph 515 characters long and the block-ref search
+67, all three with search marks in its name, and opening the page left the
+marks; without any one of the three changes, its own case fails.
+
+Still open: SQL's block cache changes before the SQL commit, so a read in
+that moment can cache the old row; and a search by SQL, or an embed block,
+whose own statement selects snippet() or highlight() in place of a block's
+fields still caches what it reads.
+---
+ kernel/model/search.go                 |   9 +-
+ kernel/model/search_cache_fts5_test.go | 163 +++++++++++++++++++++++++
+ kernel/sql/block_query.go              |  11 +-
+ kernel/sql/encrypted_query.go          |  24 +++-
+ 4 files changed, 201 insertions(+), 6 deletions(-)
+ create mode 100644 kernel/model/search_cache_fts5_test.go
+
+diff --git a/kernel/model/search.go b/kernel/model/search.go
+index c38604b..4de7486 100644
+--- a/kernel/model/search.go
++++ b/kernel/model/search.go
+@@ -2382,7 +2382,8 @@ func fullTextSearchRefBlockInBox(keyword string, beforeLen int, onlyDoc bool, bo
+              ELSE 65535 END ASC, sort ASC, length ASC`
+ 	orderBy = strings.ReplaceAll(orderBy, "${keyword}", strings.ReplaceAll(keyword, "'", "''"))
+ 	stmt += orderBy + " LIMIT " + strconv.Itoa(confSearchSnapshot.Limit)
+-	blocks := sql.SelectBlocksRawStmtNoParseInBox(stmt, confSearchSnapshot.Limit, boxID)
++	// Its rows hold snippets, so none goes into SQL's block cache.
++	blocks := sql.SelectBlocksRawStmtNoParseInBoxNoCache(stmt, confSearchSnapshot.Limit, boxID)
+ 	ret = fromSQLBlocks(&blocks, "", beforeLen)
+ 	if 1 > len(ret) {
+ 		ret = []*Block{}
+@@ -2510,7 +2511,8 @@ func fullTextSearchByFTSInBox(query, boxFilter, pathFilter string, boxArgs, path
+ 	args := []any{columnFilter() + ":(" + query + ")"}
+ 	args = append(args, boxArgs...)
+ 	args = append(args, pathArgs...)
+-	blocks := sql.SelectBlocksRawStmtArgsInBox(stmt, args, pageSize, boxID)
++	// Its rows hold snippets, so none goes into SQL's block cache.
++	blocks := sql.SelectBlocksRawStmtArgsInBoxNoCache(stmt, args, pageSize, boxID)
+ 	ret = fromSQLBlocks(&blocks, "", beforeLen)
+ 	if 1 > len(ret) {
+ 		ret = []*Block{}
+@@ -2965,7 +2967,8 @@ func highlightByFTSInBox(query, typeFilter, id, boxID string) (ret []string) {
+ 	stmt += " AND root_id = '" + id + "'"
+ 	stmt += " LIMIT " + strconv.Itoa(limit)
+ 	// MATCH 操作数通过绑定参数传递，避免 SQL 拼接注入
+-	sqlBlocks := sql.SelectBlocksRawStmtArgsInBox(stmt, []any{columnFilter() + ":(" + query + ")"}, limit, boxID)
++	// Its rows hold search marks, so none goes into SQL's block cache.
++	sqlBlocks := sql.SelectBlocksRawStmtArgsInBoxNoCache(stmt, []any{columnFilter() + ":(" + query + ")"}, limit, boxID)
+ 	for _, block := range sqlBlocks {
+ 		keyword := gulu.Str.SubstringsBetween(block.HPath, search.SearchMarkLeft, search.SearchMarkRight)
+ 		if 0 < len(keyword) {
+diff --git a/kernel/model/search_cache_fts5_test.go b/kernel/model/search_cache_fts5_test.go
+new file mode 100644
+index 0000000..dbc83ff
+--- /dev/null
++++ b/kernel/model/search_cache_fts5_test.go
+@@ -0,0 +1,163 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++import (
++	"slices"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/ast"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/search"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++)
++
++const (
++	searchCachePageID        = "20261016120000-needles"
++	searchCacheParagraphID   = "20261016120001-longpar"
++	searchCacheHPath         = "/Needle notes"
++	searchCacheParagraphName = "needle list"
++)
++
++// setupSearchCacheTest indexes one page, "Needle notes", holding one paragraph far longer than any search result,
++// which mentions needle at its start and is named "needle list", and returns the fixture and the paragraph's text.
++func setupSearchCacheTest(t *testing.T) (files *fileOperationTestFixture, paragraph string) {
++	t.Helper()
++	files = setupStructureTransactionTest(t)
++	setupFoldTransactionDatabase(t, files)
++	Conf.Search.Store(conf.NewSearch())
++	sql.ClearCache()
++	t.Cleanup(sql.ClearCache)
++
++	words := []string{"needle"}
++	for i := range 1000 {
++		words = append(words, "word"+strconv.Itoa(i))
++	}
++	paragraph = strings.Join(words, " ")
++	tree := treenode.NewTree(files.box.ID, "/"+searchCachePageID+".sy", searchCacheHPath, "Needle notes")
++	node := treenode.NewParagraph(searchCacheParagraphID)
++	node.AppendChild(&ast.Node{Type: ast.NodeText, Tokens: []byte(paragraph)})
++	node.SetIALAttr("name", searchCacheParagraphName)
++	tree.Root.FirstChild.Unlink() // the empty paragraph a new page starts with
++	tree.Root.AppendChild(node)
++	if _, err := filesys.WriteTree(tree); nil != err {
++		t.Fatal(err)
++	}
++	treenode.UpsertBlockTree(tree)
++	sql.IndexTreeQueue(tree)
++	sql.FlushQueue()
++	t.Cleanup(func() {
++		cache.RemoveTreeData(tree.ID)
++		cache.RemoveDocIAL(tree.Path)
++	})
++	if b := sql.GetBlock(searchCacheParagraphID); nil == b || paragraph != b.Content || searchCacheParagraphName != b.Name {
++		t.Fatalf("setup: SQL doesn't hold the paragraph whole: %+v", b)
++	}
++	sql.ClearCache()
++	return
++}
++
++// checkWholeBlocks reads the page and its paragraph as GetBlock serves them to the backlinks panel and ref text, once
++// ristretto has taken in whatever the search queued, and checks they read whole, with no search marks.
++func checkWholeBlocks(t *testing.T, paragraph, after string) {
++	t.Helper()
++	time.Sleep(100 * time.Millisecond) // let ristretto take in what the search queued
++	marked := func(b *sql.Block) (fields []string) {
++		for name, value := range map[string]string{"hpath": b.HPath, "name": b.Name, "alias": b.Alias, "memo": b.Memo,
++			"tag": b.Tag, "content": b.Content, "ial": b.IAL} {
++			if strings.Contains(value, search.SearchMarkLeft) || strings.Contains(value, search.SearchMarkRight) {
++				fields = append(fields, name)
++			}
++		}
++		return
++	}
++	for _, id := range []string{searchCachePageID, searchCacheParagraphID} {
++		b := sql.GetBlock(id)
++		if nil == b {
++			t.Errorf("after %s, GetBlock finds no block %s", after, id)
++			continue
++		}
++		if fields := marked(b); 0 < len(fields) {
++			t.Errorf("after %s, GetBlock gives block %s with search marks in %v: hpath %q", after, id, fields, b.HPath)
++		}
++		if searchCacheHPath != b.HPath {
++			t.Errorf("after %s, GetBlock gives block %s the hpath %q, not %q", after, id, b.HPath, searchCacheHPath)
++		}
++	}
++	if b := sql.GetBlock(searchCacheParagraphID); nil != b && paragraph != b.Content {
++		t.Errorf("after %s, GetBlock gives the paragraph cut short, %d characters of %d, ending %q",
++			after, len(b.Content), len(paragraph), b.Content[max(0, len(b.Content)-24):])
++	}
++}
++
++// A full-text search, a block-ref search, and opening a page from a search, that match a block longer than their
++// results leave the block reading whole everywhere else. On SiYuan v3.8.7 each stores the rows it read,
++// cut to a snippet or marked up for display, in SQL's block cache, which GetBlock reads first: the paragraph then reads
++// cut short, or with search marks in its name, until it changes or the cache is cleared. The full-text search does this
++// on its FTS route (fullTextSearchByFTSInBox), which a keyword search takes when it doesn't search paths and a
++// query-syntax search always takes; a one-word keyword search that also searches paths, the default, reads its rows as
++// maps and stores none. Opening a page with a search's query highlights its keywords (highlightByFTSInBox), whose rows
++// hold each matched field whole, with marks.
++func TestSearchLeavesBlocksWhole(t *testing.T) {
++	noPaths := false
++	for _, c := range []struct {
++		name    string
++		options BlockSearchOptions
++	}{
++		{"keyword search without paths", BlockSearchOptions{Query: "needle", Method: 0, Page: 1, PageSize: 10, SearchHPath: &noPaths}},
++		{"query-syntax search", BlockSearchOptions{Query: "needle", Method: 1, Page: 1, PageSize: 10}},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			_, paragraph := setupSearchCacheTest(t)
++			blocks, _, _, _, _ := FullTextSearchBlock(c.options)
++			if !slices.ContainsFunc(blocks, isSearchCacheParagraph) {
++				t.Fatalf("setup: the search didn't find the paragraph: %d results", len(blocks))
++			}
++			checkWholeBlocks(t, paragraph, "a "+c.name)
++		})
++	}
++	t.Run("block-ref search", func(t *testing.T) {
++		files, paragraph := setupSearchCacheTest(t)
++		// Typing (( in another page, the fixture's Source.
++		blocks, _ := SearchRefBlock("", files.sourceID, "needle", 36, false, false)
++		if !slices.ContainsFunc(blocks, isSearchCacheParagraph) {
++			t.Fatalf("setup: the block-ref search didn't find the paragraph: %d results", len(blocks))
++		}
++		checkWholeBlocks(t, paragraph, "a block-ref search")
++	})
++	t.Run("page opened from a search", func(t *testing.T) {
++		_, paragraph := setupSearchCacheTest(t)
++		// As /api/filetree/getDoc does when a search result is opened, with the search's keyword query.
++		_, _, _, _, _, _, _, _, _, _, _, keywords, _, _, err := GetDoc("", "", searchCachePageID, 0, "needle", nil, nil, 0, 0, 36, false, nil, true, false)
++		if nil != err || !slices.Contains(keywords, "needle") {
++			t.Fatalf("setup: opening the page didn't highlight needle: %v, %v", keywords, err)
++		}
++		checkWholeBlocks(t, paragraph, "opening the page from a search")
++	})
++}
++
++func isSearchCacheParagraph(b *Block) bool {
++	return searchCacheParagraphID == b.ID
++}
+diff --git a/kernel/sql/block_query.go b/kernel/sql/block_query.go
+index 2e23a00..aae9cca 100644
+--- a/kernel/sql/block_query.go
++++ b/kernel/sql/block_query.go
+@@ -868,13 +868,22 @@ func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, q
+ }
+ 
+ func scanBlockRows(rows *sql.Rows) (ret *Block) {
++	if ret = scanBlockRowsNoCache(rows); nil != ret {
++		putBlockCache(ret)
++	}
++	return
++}
++
++// scanBlockRowsNoCache scans a row as scanBlockRows does but stores nothing in SQL's block cache. A search's rows hold
++// snippets and search marks rather than the block as stored, and GetBlock, which reads the cache first, would serve them
++// to the backlinks panel and ref text.
++func scanBlockRowsNoCache(rows *sql.Rows) (ret *Block) {
+ 	var block Block
+ 	if err := rows.Scan(&block.ID, &block.ParentID, &block.RootID, &block.Hash, &block.Box, &block.Path, &block.HPath, &block.Name, &block.Alias, &block.Memo, &block.Tag, &block.Content, &block.FContent, &block.Markdown, &block.Length, &block.Type, &block.SubType, &block.IAL, &block.Sort, &block.Created, &block.Updated); err != nil {
+ 		logging.LogErrorf("query scan field failed: %s\n%s", err, logging.ShortStack())
+ 		return
+ 	}
+ 	ret = &block
+-	putBlockCache(ret)
+ 	return
+ }
+ 
+diff --git a/kernel/sql/encrypted_query.go b/kernel/sql/encrypted_query.go
+index ccfe0d1..77ba60d 100644
+--- a/kernel/sql/encrypted_query.go
++++ b/kernel/sql/encrypted_query.go
+@@ -357,6 +357,16 @@ func QueryNoLimitArgsInBox(stmt, boxID string, args ...any) (ret []map[string]an
+ // SelectBlocksRawStmtArgsInBox 在指定 box 的 db 里执行参数化原始 SQL 查询 blocks。
+ // 与 SelectBlocksRawStmtArgs 对应，绕开 sqlparser 对 "?" 占位的改写。
+ func SelectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtArgsInBox(stmt, args, limit, boxID, scanBlockRows)
++}
++
++// SelectBlocksRawStmtArgsInBoxNoCache reads rows as SelectBlocksRawStmtArgsInBox does but stores none in SQL's block
++// cache, for a search whose rows hold snippets or search marks rather than the blocks as stored.
++func SelectBlocksRawStmtArgsInBoxNoCache(stmt string, args []any, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtArgsInBox(stmt, args, limit, boxID, scanBlockRowsNoCache)
++}
++
++func selectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID string, scan func(*sql.Rows) *Block) (ret []*Block) {
+ 	if !checkRawBlockQueryStmt(stmt, boxID) {
+ 		return
+ 	}
+@@ -375,7 +385,7 @@ func SelectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID stri
+ 	var count, errCount int
+ 	for rows.Next() {
+ 		count++
+-		if block := scanBlockRows(rows); nil != block {
++		if block := scan(rows); nil != block {
+ 			ret = append(ret, block)
+ 		} else {
+ 			logging.LogWarnf("raw sql query [%s] failed", stmt)
+@@ -664,6 +674,16 @@ func QueryRefIDsByDefIDInBox(defID string, containChildren bool, boxID string) (
+ 
+ // SelectBlocksRawStmtNoParseInBox 与 SelectBlocksRawStmtNoParse 一致，但按 boxID 路由。
+ func SelectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtNoParseInBox(stmt, limit, boxID, scanBlockRows)
++}
++
++// SelectBlocksRawStmtNoParseInBoxNoCache reads rows as SelectBlocksRawStmtNoParseInBox does but stores none in SQL's
++// block cache, for a search whose rows hold snippets or search marks rather than the blocks as stored.
++func SelectBlocksRawStmtNoParseInBoxNoCache(stmt string, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtNoParseInBox(stmt, limit, boxID, scanBlockRowsNoCache)
++}
++
++func selectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string, scan func(*sql.Rows) *Block) (ret []*Block) {
+ 	if !checkRawBlockQueryStmt(stmt, boxID) {
+ 		return
+ 	}
+@@ -681,7 +701,7 @@ func SelectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string) (ret
+ 	var count, errCount int
+ 	for rows.Next() {
+ 		count++
+-		if block := scanBlockRows(rows); nil != block {
++		if block := scan(rows); nil != block {
+ 			ret = append(ret, block)
+ 		} else {
+ 			logging.LogWarnf("raw sql query [%s] failed", stmt)
+-- 
+2.53.0
+

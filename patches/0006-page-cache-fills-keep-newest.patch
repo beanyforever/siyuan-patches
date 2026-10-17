@@ -1,0 +1,501 @@
+From fef4d7c4c20f0bb64f96b9abf05abb75c9d5d7bb Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:18:53 -0400
+Subject: [PATCH] A page read while it is saved no longer caches the copy from
+ before
+
+SiYuan's page cache holds pages as their files do, and a load that misses
+it reads the page's file, then caches what it read. Nothing ordered that
+store against a save of the same page: a load that read the file just
+before a save wrote it could cache its copy after the save had cached its
+own, leaving the cache older than the file, and the next edit, which loads
+the page from the cache, saved that older copy over the file, losing the
+save on disk. A page isn't cached after SiYuan starts, after a move to
+another notebook drops its entries (0005), or after sync or an asset rename
+rewrites its file, so a read of it while an edit to it is saved is ordinary
+then. A WriteTree that finds the file already holds its bytes caches what
+it read in the same way.
+
+Both stores are now fills, as in 0004's attribute caches: the load and
+WriteTree take a FillToken before their lookup and store through
+FillTreeDataInBox, which, under the page cache's lock, stores only if the
+page's file isn't being written and nothing wrote the page or removed it
+from the cache since the token; a page too big for the cache isn't stored.
+The versions are the ones 0004 keeps for block fills, per page id rather
+than per notebook key, so removing a page stops a fill whatever notebook's
+key it was to store under; they outlive the page's entries, and a clear
+refuses every fill under way. A write's store, SetTreeDataInBox, bumps the
+page's version as well as the bracket around the file write. No lock is held
+across a load: a lock per page deadlocked in Go tests, against a page
+rebuilding a missing parent and, beside 0004's lock, against a commit. The
+page cache already keeps a generation per key against ristretto taking a
+store in late, so neither store waits.
+
+TestTreeFillRacesWrite races a LoadTree of an uncached page against a
+WriteTree of it for 1,000 rounds with jitter, then makes the next edit as
+SiYuan does: on v3.8.7 with 0001 to 0005 the cache was left older than the
+file in 918 rounds, and the next edit lost the write from the file in each,
+and with the patch in none. TestTreeFillsDuringFileWriteCacheNothing reads
+the page with each fill, a LoadTree and a WriteTree of the bytes the file
+holds, while a write of its file is under way, which places the read inside
+the write as no race from a test can for WriteTree, whose read and store are
+microseconds apart: each case fails without its own change. In the cache
+package, TestTreeFillTakenBeforeWriteDoesNotStore,
+TestTreeFillDuringFileWriteDoesNotStore, TestTreeFillAfterRemoveDoesNotStore
+and TestTreeFillUnracedStores check FillTreeDataInBox itself: with a fill
+that ignores its token, as the old store did, the first three fail in every
+case, and without the check that no write is under way, the second does.
+
+Still open: a load that fixes a damaged or older-format page's file writes
+the fixed copy back unconditionally, so a save landing between its read and
+that write is lost from the file. The cache keeps the save if it took the
+save's store in, and then the next edit writes it back.
+---
+ kernel/cache/tree.go                  |  48 +++++++-
+ kernel/cache/tree_fill_test.go        | 130 ++++++++++++++++++++
+ kernel/filesys/tree.go                |   8 +-
+ kernel/filesys/tree_fill_race_test.go | 167 ++++++++++++++++++++++++++
+ 4 files changed, 346 insertions(+), 7 deletions(-)
+ create mode 100644 kernel/cache/tree_fill_test.go
+ create mode 100644 kernel/filesys/tree_fill_race_test.go
+
+diff --git a/kernel/cache/tree.go b/kernel/cache/tree.go
+index c0f44dd..d85558a 100644
+--- a/kernel/cache/tree.go
++++ b/kernel/cache/tree.go
+@@ -85,6 +85,8 @@ func GetTreeDataInBox(rootID, boxID string) (raw []byte, ok bool) {
+ 	return raw, true
+ }
+ 
++// SetTreeDataInBox caches raw, what a write has just put in page rootID's file in notebook boxID. A read that missed
++// the cache and loaded the file stores what it loaded with FillTreeDataInBox instead.
+ func SetTreeDataInBox(rootID, boxID string, raw []byte) {
+ 	if raw == nil {
+ 		return
+@@ -93,6 +95,33 @@ func SetTreeDataInBox(rootID, boxID string, raw []byte) {
+ 		RemoveTreeDataInBox(rootID, boxID)
+ 		return
+ 	}
++	entry := newTreeCacheEntry(raw)
++	treeCacheKeysMu.Lock()
++	defer treeCacheKeysMu.Unlock()
++	// A fill whose reader took its token before this write may hold the page from before it.
++	treeVersions.bump(rootID)
++	putTreeCacheEntryLocked(rootID, boxID, entry)
++}
++
++// FillTreeDataInBox caches raw, which a reader that took token before its first lookup loaded from page rootID's file
++// in notebook boxID, unless the file is being written or something wrote the page or removed it from this cache since
++// token: the reader may then have loaded the page from before, and the next edit would save that copy over the file.
++// A page too big for the cache isn't stored. It reports whether it stored.
++func FillTreeDataInBox(rootID, boxID string, raw []byte, token FillToken) bool {
++	if raw == nil || len(raw) >= treeCacheMaxCost {
++		return false
++	}
++	entry := newTreeCacheEntry(raw)
++	treeCacheKeysMu.Lock()
++	defer treeCacheKeysMu.Unlock()
++	if !treeFreshLocked(rootID, token) {
++		return false
++	}
++	putTreeCacheEntryLocked(rootID, boxID, entry)
++	return true
++}
++
++func newTreeCacheEntry(raw []byte) *treeCacheEntry {
+ 	entry := &treeCacheEntry{rawSize: len(raw)}
+ 	// 小文档不压缩；只有实际减少驻留字节时才保存压缩结果。
+ 	if len(raw) >= 1024 && treeCacheEncoder != nil && treeCacheDecoder != nil {
+@@ -105,9 +134,12 @@ func SetTreeDataInBox(rootID, boxID string, raw []byte) {
+ 	if !entry.compressed {
+ 		entry.raw = bytes.Clone(raw)
+ 	}
++	return entry
++}
++
++// putTreeCacheEntryLocked stores entry as the page's newest copy in notebook boxID; treeCacheKeysMu must be held.
++func putTreeCacheEntryLocked(rootID, boxID string, entry *treeCacheEntry) {
+ 	key := treeCacheKey(rootID, boxID)
+-	treeCacheKeysMu.Lock()
+-	defer treeCacheKeysMu.Unlock()
+ 	treeCacheGeneration++
+ 	entry.generation = treeCacheGeneration
+ 	keys := treeCacheKeys[rootID]
+@@ -120,9 +152,11 @@ func SetTreeDataInBox(rootID, boxID string, raw []byte) {
+ }
+ 
+ // treeVersions and treeWriting say, per page id, when the page was last written or removed from this cache, and how
+-// many writes of its file are under way. A load storing what it read bumps neither, so they tell a block attribute
+-// fill whether the page it read the block from may have changed since its FillToken (TreeFresh). treeCacheKeysMu
+-// guards them.
++// many writes of its file are under way. A load storing what it read bumps neither, so they tell a fill whether the
++// page it read may have changed since its FillToken: the page cache's own fills (FillTreeDataInBox), and block
++// attribute fills, which read a block from its page (TreeFresh). They are kept per page id, not per notebook key, and
++// outlive the page's entries, so a removal stops a fill whatever key it was to store under. treeCacheKeysMu guards
++// them.
+ var treeVersions = newFillVersions()
+ var treeWriting = map[string]int{}
+ 
+@@ -151,6 +185,10 @@ func EndTreeWrite(rootID string) {
+ func TreeFresh(rootID string, token FillToken) bool {
+ 	treeCacheKeysMu.Lock()
+ 	defer treeCacheKeysMu.Unlock()
++	return treeFreshLocked(rootID, token)
++}
++
++func treeFreshLocked(rootID string, token FillToken) bool {
+ 	return 0 == treeWriting[rootID] && treeVersions.fresh(rootID, token)
+ }
+ 
+diff --git a/kernel/cache/tree_fill_test.go b/kernel/cache/tree_fill_test.go
+new file mode 100644
+index 0000000..871d078
+--- /dev/null
++++ b/kernel/cache/tree_fill_test.go
+@@ -0,0 +1,130 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"bytes"
++	"testing"
++)
++
++// A page cache fill is a load that missed the cache, read the page's file and caches what it read. It takes a
++// FillToken before its lookup, and lands only if nothing wrote the page, or removed it from the cache, since.
++
++const treeFillBox, treeFillOtherBox, treeFillRoot = "20261017090000-notebk1", "20261017090000-notebk2", "20261017090000-fillpag"
++
++var treeFillOlder, treeFillNewer = []byte(`{"ID":"older"}`), []byte(`{"ID":"newer"}`)
++
++func readTreeFillPage() []byte {
++	treeCache.Wait()
++	raw, _ := GetTreeDataInBox(treeFillRoot, treeFillBox)
++	return raw
++}
++
++// A fill that took its token before a page write doesn't store, so the write stays: a save landing while the fill
++// reads the file from before it, whether or not the save brackets its file write.
++func TestTreeFillTakenBeforeWriteDoesNotStore(t *testing.T) {
++	cases := []struct {
++		name  string
++		write func()
++	}{
++		{"write", func() { SetTreeDataInBox(treeFillRoot, treeFillBox, treeFillNewer) }},
++		{"write of the file, bracketed", func() {
++			BeginTreeWrite(treeFillRoot)
++			SetTreeDataInBox(treeFillRoot, treeFillBox, treeFillNewer)
++			EndTreeWrite(treeFillRoot)
++		}},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			ClearTreeCache()
++			t.Cleanup(ClearTreeCache)
++			token := NewFillToken() // the load missed, and is about to read the file
++			c.write()
++			if FillTreeDataInBox(treeFillRoot, treeFillBox, treeFillOlder, token) {
++				t.Fatal("a fill that took its token before a write stored the file's older copy")
++			}
++			if got := readTreeFillPage(); !bytes.Equal(got, treeFillNewer) {
++				t.Fatalf("after a write and a fill that started before it, a read gave %q, want %q", got, treeFillNewer)
++			}
++		})
++	}
++}
++
++// A fill that looked while a write of the page's file was under way doesn't store, before the write ends or after:
++// what it read may be the file from before the write, or a part-written one.
++func TestTreeFillDuringFileWriteDoesNotStore(t *testing.T) {
++	ClearTreeCache()
++	t.Cleanup(ClearTreeCache)
++	BeginTreeWrite(treeFillRoot)
++	token := NewFillToken()
++	if FillTreeDataInBox(treeFillRoot, treeFillBox, treeFillOlder, token) {
++		EndTreeWrite(treeFillRoot)
++		t.Fatal("a fill stored while a write of the page's file was under way")
++	}
++	EndTreeWrite(treeFillRoot)
++	if FillTreeDataInBox(treeFillRoot, treeFillBox, treeFillOlder, token) {
++		t.Fatal("a fill that looked while a write of the page's file was under way stored once it ended")
++	}
++	if got := readTreeFillPage(); nil != got {
++		t.Fatalf("after fills that looked during a write of the page's file, a read gave %q rather than missing", got)
++	}
++}
++
++// A remove or a clear between a fill's token and its store stops the fill, as a move, a deletion, sync or an asset
++// rename drops a page from the cache while a load of it reads the file from before. A remove under another notebook's
++// key stops it too: versions are kept per page, so a remove covers keys the cache's index of them never held.
++func TestTreeFillAfterRemoveDoesNotStore(t *testing.T) {
++	cases := []struct {
++		name   string
++		remove func()
++	}{
++		{"removed", func() { RemoveTreeData(treeFillRoot) }},
++		{"removed in its notebook", func() { RemoveTreeDataInBox(treeFillRoot, treeFillBox) }},
++		{"removed in another notebook", func() { RemoveTreeDataInBox(treeFillRoot, treeFillOtherBox) }},
++		{"cache cleared", ClearTreeCache},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			ClearTreeCache()
++			t.Cleanup(ClearTreeCache)
++			token := NewFillToken()
++			c.remove()
++			if FillTreeDataInBox(treeFillRoot, treeFillBox, treeFillOlder, token) {
++				t.Fatal("a fill stored after a remove between its token and its store")
++			}
++			if got := readTreeFillPage(); nil != got {
++				t.Fatalf("after a remove between a fill's token and its store, a read gave %q rather than missing", got)
++			}
++		})
++	}
++}
++
++// A fill nothing raced stores, and a read straight after it gets what it stored; a write after it replaces it.
++func TestTreeFillUnracedStores(t *testing.T) {
++	ClearTreeCache()
++	t.Cleanup(ClearTreeCache)
++	if !FillTreeDataInBox(treeFillRoot, treeFillBox, treeFillOlder, NewFillToken()) {
++		t.Fatal("a fill nothing raced didn't store")
++	}
++	if got := readTreeFillPage(); !bytes.Equal(got, treeFillOlder) {
++		t.Fatalf("after a fill nothing raced, a read gave %q, want %q", got, treeFillOlder)
++	}
++	SetTreeDataInBox(treeFillRoot, treeFillBox, treeFillNewer)
++	if got := readTreeFillPage(); !bytes.Equal(got, treeFillNewer) {
++		t.Fatalf("after a write over a fill, a read gave %q, want %q", got, treeFillNewer)
++	}
++}
+diff --git a/kernel/filesys/tree.go b/kernel/filesys/tree.go
+index adeaca0..11a3608 100644
+--- a/kernel/filesys/tree.go
++++ b/kernel/filesys/tree.go
+@@ -204,6 +204,8 @@ func LoadTreeWithFix(boxID, p string, luteEngine *lute.Lute) (ret *parse.Tree, n
+ 
+ 	rootID := util.GetTreeID(p)
+ 	filePath := filepath.Join(util.DataDir, boxID, p)
++	// Taken before the lookup: a write of the page after it means the file read below may be from before the write.
++	token := cache.NewFillToken()
+ 	if raw, ok := cache.GetTreeDataInBox(rootID, boxID); ok {
+ 		// 内容缓存不代表请求路径仍然有效，移动或删除后的旧路径不能触发补树。
+ 		if err = checkTreeFile(filePath); err != nil {
+@@ -234,7 +236,7 @@ func LoadTreeWithFix(boxID, p string, luteEngine *lute.Lute) (ret *parse.Tree, n
+ 
+ 	ret, err = LoadTreeByData(data, boxID, p, luteEngine)
+ 	if nil == err {
+-		cache.SetTreeDataInBox(rootID, boxID, data)
++		cache.FillTreeDataInBox(rootID, boxID, data, token)
+ 	}
+ 	return
+ }
+@@ -507,6 +509,8 @@ func WriteTree(tree *parse.Tree) (size uint64, err error) {
+ 	}
+ 
+ 	// 缓存与待写入数据一致时跳过落盘；缓存未命中时再读盘比对，避免无变更的重复写入
++	// Skipping the write after reading the file makes its store a fill, which mustn't land over a write since the lookup.
++	token := cache.NewFillToken()
+ 	if cachedData, ok := cache.GetTreeDataInBox(tree.ID, tree.Box); ok {
+ 		if len(cachedData) == len(data) && bytes.Equal(cachedData, data) {
+ 			return
+@@ -516,7 +520,7 @@ func WriteTree(tree *parse.Tree) (size uint64, err error) {
+ 		if diskData, readErr := filelock.ReadFile(filePath); nil == readErr {
+ 			decDisk, decErr := decryptDataWithDEK(tree.Box, tree.Path, diskData, dek)
+ 			if decErr == nil && len(decDisk) == len(data) && bytes.Equal(decDisk, data) {
+-				cache.SetTreeDataInBox(tree.ID, tree.Box, data)
++				cache.FillTreeDataInBox(tree.ID, tree.Box, data, token)
+ 				return
+ 			}
+ 		}
+diff --git a/kernel/filesys/tree_fill_race_test.go b/kernel/filesys/tree_fill_race_test.go
+new file mode 100644
+index 0000000..f9941ba
+--- /dev/null
++++ b/kernel/filesys/tree_fill_race_test.go
+@@ -0,0 +1,167 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"math/rand"
++	"os"
++	"path/filepath"
++	"strconv"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/ast"
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// A page cache fill racing a page write keeps the write. A LoadTree that misses the page cache reads the file and
++// then caches what it read; a WriteTree on another goroutine writes the file and caches its own bytes. Nothing orders
++// the two stores, so without the fix the fill can land last and leave the page cache older than the file, and the
++// next edit, which loads the page from the cache, writes that older copy back over the file. A page isn't cached after
++// a restart or a move, and a read of it while an edit to it is saved is ordinary. Rounds are many, with jitter, since
++// only the timing differs; with a FillToken taken before the fill's lookup, none go stale.
++func TestTreeFillRacesWrite(t *testing.T) {
++	box, _, _, _ := setupStalePathTest(t)
++	p := "/20261016000000-racefil.sy"
++	tree := treenode.NewTree(box, p, "/Race", "Race")
++	tree.Root.SetIALAttr("custom-n", "0")
++	// A page of realistic size, so that parsing it takes as long as it does in use.
++	for j := range 200 {
++		paragraph := treenode.NewParagraph("")
++		paragraph.AppendChild(&ast.Node{Type: ast.NodeText, Tokens: []byte("Some paragraph text that makes the page a realistic size " + strconv.Itoa(j))})
++		tree.Root.AppendChild(paragraph)
++	}
++	if _, err := WriteTree(tree); err != nil {
++		t.Fatal(err)
++	}
++	filePath := filepath.Join(util.DataDir, box, p)
++	const rounds = 1000
++	stale, lost := 0, 0
++	for i := 1; i <= rounds; i++ {
++		cache.RemoveTreeDataInBox(tree.ID, box) // the next load misses
++		want := strconv.Itoa(i)
++		var wg sync.WaitGroup
++		wg.Add(2)
++		go func() { defer wg.Done(); _, _ = LoadTree(box, p, util.NewLute()) }()
++		jitter := time.Duration(rand.Intn(400)) * time.Microsecond
++		go func() {
++			defer wg.Done()
++			time.Sleep(jitter)
++			tree.Root.SetIALAttr("custom-n", want)
++			if _, err := WriteTree(tree); err != nil {
++				t.Error(err)
++			}
++		}()
++		wg.Wait()
++		time.Sleep(5 * time.Millisecond) // let ristretto take queued sets in
++
++		disk, err := os.ReadFile(filePath)
++		if err != nil {
++			t.Fatal(err)
++		}
++		onDisk, err := LoadTreeByData(disk, box, p, util.NewLute())
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := onDisk.Root.IALAttr("custom-n"); got != want {
++			t.Fatalf("round %d: the file holds custom-n=%q, want %q", i, got, want)
++		}
++		// The next edit loads the page as SiYuan does, from the cache first, and saves it.
++		loaded, err := LoadTree(box, p, util.NewLute())
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := loaded.Root.IALAttr("custom-n"); got != want {
++			stale++
++			loaded.Root.SetIALAttr("custom-other", want)
++			if _, err = WriteTree(loaded); err != nil {
++				t.Fatal(err)
++			}
++			disk, _ = os.ReadFile(filePath)
++			if after, _ := LoadTreeByData(disk, box, p, util.NewLute()); nil != after && after.Root.IALAttr("custom-n") != want {
++				lost++
++			}
++			// Put the file and the cache back in step for the next round.
++			if _, err = WriteTree(tree); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	t.Logf("%d rounds: the page cache was older than the file after %d, and the next edit lost the write from the file after %d", rounds, stale, lost)
++	if 0 < stale {
++		t.Fatalf("a page cache fill racing a page write left the cache older than the file in %d of %d rounds, "+
++			"and the next edit lost the write from the file in %d", stale, rounds, lost)
++	}
++}
++
++// Both of the page cache's fills cache nothing they read while a write of the page's file is under way, as a save is
++// between starting to write the file and caching its bytes: a LoadTree that missed the cache, and a WriteTree that
++// finds the file already holds its bytes, so skips writing and caches what it read. Once no write is under way, each
++// caches the file as before. Unlike TestTreeFillRacesWrite, this places the read inside the write, so it shows each
++// fill's check on its own, WriteTree's included, whose read and store are too close together to race from a test.
++func TestTreeFillsDuringFileWriteCacheNothing(t *testing.T) {
++	cases := []struct {
++		name string
++		read func(t *testing.T, tree *parse.Tree)
++	}{
++		{"LoadTree", func(t *testing.T, tree *parse.Tree) {
++			if _, err := LoadTree(tree.Box, tree.Path, util.NewLute()); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{"WriteTree of the bytes the file holds", func(t *testing.T, tree *parse.Tree) {
++			if size, err := WriteTree(tree); err != nil || 0 != size {
++				t.Fatalf("a WriteTree of the bytes the file holds wrote %d bytes: %v", size, err)
++			}
++		}},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			box, root, _, _ := setupStalePathTest(t)
++			tree := treenode.NewTree(box, "/"+root+".sy", "/Page", "Page")
++			if _, err := WriteTree(tree); err != nil {
++				t.Fatal(err)
++			}
++			cache.RemoveTreeDataInBox(tree.ID, box) // as after a restart
++
++			cache.BeginTreeWrite(tree.ID) // another save of the page is writing its file
++			c.read(t, tree)
++			time.Sleep(5 * time.Millisecond) // let ristretto take queued sets in
++			_, cached := cache.GetTreeDataInBox(tree.ID, box)
++			cache.EndTreeWrite(tree.ID)
++			if cached {
++				t.Fatal("a read cached the page's file while a write of it was under way")
++			}
++
++			c.read(t, tree)
++			deadline := time.Now().Add(time.Second)
++			for {
++				if _, ok := cache.GetTreeDataInBox(tree.ID, box); ok {
++					break
++				}
++				if time.Now().After(deadline) {
++					t.Fatal("a read nothing raced didn't cache the page's file")
++				}
++				time.Sleep(time.Millisecond)
++			}
++		})
++	}
++}
+-- 
+2.53.0
+

@@ -1,0 +1,1315 @@
+From e21101ed7da01335a1f1541041e56f6d3af439b4 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 07:46:32 -0400
+Subject: [PATCH] The attribute caches keep the newest attributes
+
+SiYuan caches pages' and blocks' attributes in ristretto, which takes in a
+key it doesn't hold yet later, on its own goroutine, and turns away a second
+put of that key queued before the first is taken in. "+ New" in a database
+does this to the page it makes: placing the row renders the view, which
+reads the new page's attributes from its file and caches them before the
+page is bound (getNearItem, BatchGetBlockAttrs, getBlockAttrsFromTree), and
+a fraction of a millisecond later bindBlockAv0 puts them again with
+custom-avs. About 1 time in 6 that second put was turned away, and
+/api/attr/getBlockAttrs and /api/av/getAttributeViewKeys named no database
+for the page until SiYuan restarted. A read that missed the cache also
+stored what it had loaded from the file even if a write landed meanwhile, so
+it could replace newer attributes with older ones; and a put ristretto
+turned away for want of room left the block's other key, the bare one an
+edit writes, to be served instead, older still.
+
+Every put to the block or the page attribute cache is now a write or a fill.
+A write, for attributes being set, takes the cache's lock, bumps the block's
+or the page's version, puts, waits until the cache has taken the put in or
+turned it away, and reads it back; one turned away, or too big, removes
+every key of the block or page, so reads go to the file rather than to an
+older copy. A fill, for what a read that missed loaded from the file, takes
+a FillToken before its first lookup and lands only if the key is still
+missing and nothing wrote or removed it since. A block's fill also checks
+the page it read the block from, since a page write changes its blocks'
+attributes without bumping their versions: WriteTree and
+WriteTreeIfUnchanged bracket their file write with BeginTreeWrite and
+EndTreeWrite, and removing a page from the page cache bumps its version too.
+Fills wait like writes, so none is left queued to turn a write away. Removes
+and clears take the lock and bump the versions, and the index of each
+block's keys is kept under the same lock, so a remove never misses a put.
+The lock covers only the cache's own calls, never a file or page load; a
+block's fill takes the page cache's lock inside it. Versions outlive removal
+and are forgotten all at once past 16,384 keys per cache, refusing the fills
+under way.
+
+The fills are getBlockAttrsFromTree, reached from GetBlockAttrs and
+BatchGetBlockAttrs, box.docIAL, the index rebuild, indexBoxDocIfNeeded and
+an import's reload; every other put is a write. The kanban and gallery
+renders hand BatchGetBlockAttrsWitTrees trees they loaded earlier, so it no
+longer caches what it reads. Three removes of a page's attributes just
+before putting them become one put each, and SetBlockReminder caches the
+attributes of the block it set the reminder on, as written, rather than the
+copy it read through the cache.
+
+Left open: a write whose entry is gone (evicted, or turned away) before a
+fill inside the same transaction, which then reads the file from before the
+commit; a failed transaction's puts, which stay cached ahead of the file;
+the copies an import or a database duplicate can cache of custom-avs that
+the file never gets; and a block's two keys, so a notebook-key entry can
+hide a newer edit's bare copy, and a page's updated can lag its edits.
+
+Its Go tests are TestIALCacheKeepsLatestPut and
+TestIALCacheTurnedAwayWriteLeavesNoOlderCopy in ial_latest_test.go and the
+fill tests in ial_fill_test.go, in kernel/cache;
+TestBlockAttrsFillThenWriteKeepsWrite,
+TestBatchGetBlockAttrsWitTreesCachesNothing,
+TestBlockAttrsFillAfterWriteDoesNotStore and
+TestBlockAttrsReadsFillWhatTheyLoad in kernel/sql; and
+TestWriteTreeRefusesBlockFillsTakenBefore in kernel/filesys. On v3.8.7 with
+0001 to 0003 both tests in ial_latest_test.go fail, and with the first form
+of this patch, which only waited for puts, the second does; the others use
+the interface this patch adds.
+---
+ kernel/cache/fill.go                 |  68 ++++++++
+ kernel/cache/ial.go                  | 156 +++++++++++++-----
+ kernel/cache/ial_fill_test.go        | 233 +++++++++++++++++++++++++++
+ kernel/cache/ial_latest_test.go      | 115 +++++++++++++
+ kernel/cache/tree.go                 |  38 +++++
+ kernel/filesys/ial_fill_test.go      |  73 +++++++++
+ kernel/filesys/tree.go               |   3 +
+ kernel/filesys/tree_compare_write.go |   3 +
+ kernel/model/blockial.go             |   9 +-
+ kernel/model/box_doc.go              |   3 +-
+ kernel/model/file.go                 |   3 +-
+ kernel/model/import.go               |   4 +-
+ kernel/model/index.go                |   3 +-
+ kernel/sql/block.go                  |  19 ++-
+ kernel/sql/ial_fill_test.go          | 131 +++++++++++++++
+ 15 files changed, 807 insertions(+), 54 deletions(-)
+ create mode 100644 kernel/cache/fill.go
+ create mode 100644 kernel/cache/ial_fill_test.go
+ create mode 100644 kernel/cache/ial_latest_test.go
+ create mode 100644 kernel/filesys/ial_fill_test.go
+ create mode 100644 kernel/sql/ial_fill_test.go
+
+diff --git a/kernel/cache/fill.go b/kernel/cache/fill.go
+new file mode 100644
+index 0000000..f99a4a8
+--- /dev/null
++++ b/kernel/cache/fill.go
+@@ -0,0 +1,68 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import "sync/atomic"
++
++// FillToken is taken by a reader before it first looks in a cache and, on a miss, loads the file. A fill, which caches
++// what the reader loaded, lands only if no write, removal or clear of the key came after the token, so it never
++// replaces anything newer than what it read. One clock serves the attribute caches and the page cache, so one token
++// can be checked against several: a block's fill checks the block and the page it read the block from.
++type FillToken uint64
++
++var fillClock atomic.Uint64
++
++// NewFillToken reads the clock that writes, removals and clears advance.
++func NewFillToken() FillToken {
++	return FillToken(fillClock.Load())
++}
++
++// fillVersionsLimit bounds how many keys a fillVersions remembers. Past it, every key is forgotten and the fills that
++// began earlier are refused, so memory stays bounded at the cost of a few refused fills.
++const fillVersionsLimit = 1 << 14
++
++// fillVersions records, per key, the clock's value at its last write or removal, and keeps it when the cache's entry
++// goes, so a fill that began before a removal is still refused. A clear raises the floor below which every token is
++// refused. The cache that owns it guards it with its lock.
++type fillVersions struct {
++	floor uint64            // tokens below it began before the last clear, or before the keys were forgotten
++	last  map[string]uint64 // key -> the clock's value at its last write or removal
++}
++
++func newFillVersions() *fillVersions {
++	return &fillVersions{last: map[string]uint64{}}
++}
++
++// bump records a write or a removal of key.
++func (v *fillVersions) bump(key string) {
++	if len(v.last) >= fillVersionsLimit {
++		v.reset()
++	}
++	v.last[key] = fillClock.Add(1)
++}
++
++// fresh reports whether a fill of key that took token may still land.
++func (v *fillVersions) fresh(key string, token FillToken) bool {
++	t := uint64(token)
++	return t >= v.floor && v.last[key] <= t
++}
++
++// reset forgets every key and refuses the fills that began before it.
++func (v *fillVersions) reset() {
++	v.floor = fillClock.Add(1)
++	v.last = map[string]uint64{}
++}
+diff --git a/kernel/cache/ial.go b/kernel/cache/ial.go
+index de41b2f..9b00341 100644
+--- a/kernel/cache/ial.go
++++ b/kernel/cache/ial.go
+@@ -23,6 +23,13 @@ import (
+ 	"github.com/dgraph-io/ristretto"
+ )
+ 
++// The attribute caches hold a page's or a block's attributes. A write puts attributes being set; a fill puts what a
++// read that missed loaded from the file (FillDocIALInBox, FillBlockIALInBox). Each cache has one lock, which guards
++// its puts, removes and clears, its index of each page's or block's keys, and its fill versions: a write or a remove
++// bumps the version, and a fill lands only if the key is still missing and the version hasn't moved since its reader
++// took its FillToken. The lock covers only the cache's own calls, never a file or page load; the one other lock taken
++// while it is held is the page cache's, when a block's fill checks its page.
++
+ var docIALCache, _ = ristretto.NewCache(&ristretto.Config{
+ 	NumCounters: AdmissionCounters,
+ 	MaxCost:     DefaultMaxCostBytes,
+@@ -30,6 +37,7 @@ var docIALCache, _ = ristretto.NewCache(&ristretto.Config{
+ })
+ var docIALCacheKeys = map[string]map[string]struct{}{}
+ var docIALCacheKeysMu sync.Mutex
++var docIALVersions = newFillVersions() // by page path
+ 
+ func docIALCacheKey(p, boxID string) string {
+ 	return boxID + "\x00" + p
+@@ -44,23 +52,71 @@ func ialCacheCost(key string, ial map[string]string) int64 {
+ 	return cost
+ }
+ 
++// storeIALLocked puts attributes in an attribute cache, returns once the cache has taken them in or turned them away,
++// and reports which. ristretto takes in a key it doesn't hold yet later, on its own goroutine, and turns away a second
++// put of that key queued before the first is taken in, as one it already holds; without waiting, the first put's
++// attributes would stay, and a page made a row just after it is made would read as bound to no database. It can also
++// turn a put away for want of room. The caller holds the cache's lock, so puts take turns and no put is ever queued
++// behind another; these caches set no callback that could wait on a lock.
++func storeIALLocked(c *ristretto.Cache, key string, ial map[string]string, cost int64) bool {
++	c.Set(key, maps.Clone(ial), cost)
++	c.Wait()
++	_, ok := c.Get(key)
++	return ok
++}
++
++func rememberIALKeyLocked(index map[string]map[string]struct{}, id, key string) {
++	keys := index[id]
++	if keys == nil {
++		keys = map[string]struct{}{}
++		index[id] = keys
++	}
++	keys[key] = struct{}{}
++}
++
++func forgetIALKeyLocked(index map[string]map[string]struct{}, id, key string) {
++	if keys := index[id]; keys != nil {
++		delete(keys, key)
++		if len(keys) == 0 {
++			delete(index, id)
++		}
++	}
++}
++
++// PutDocIALInBox writes page p's attributes. A write the cache can't hold, for its size or because ristretto turns it
++// away, removes every key of p instead, so no older copy is left to read.
+ func PutDocIALInBox(p, boxID string, ial map[string]string) {
+ 	key := docIALCacheKey(p, boxID)
+ 	cost := ialCacheCost(key, ial)
+-	if cost >= docIALCache.MaxCost() {
+-		RemoveDocIALInBox(p, boxID)
++	docIALCacheKeysMu.Lock()
++	defer docIALCacheKeysMu.Unlock()
++	docIALVersions.bump(p)
++	if cost >= docIALCache.MaxCost() || !storeIALLocked(docIALCache, key, ial, cost) {
++		removeDocIALLocked(p)
+ 		return
+ 	}
+-	docIALCache.Set(key, maps.Clone(ial), cost)
++	rememberIALKeyLocked(docIALCacheKeys, p, key)
++}
+ 
++// FillDocIALInBox caches attributes read from page p's file by a reader that took token before it first looked in the
++// cache. It lands only if p's entry is still missing and nothing wrote or removed p since token, and reports whether it
++// did.
++func FillDocIALInBox(p, boxID string, ial map[string]string, token FillToken) bool {
++	key := docIALCacheKey(p, boxID)
++	cost := ialCacheCost(key, ial)
+ 	docIALCacheKeysMu.Lock()
+ 	defer docIALCacheKeysMu.Unlock()
+-	keys := docIALCacheKeys[p]
+-	if keys == nil {
+-		keys = map[string]struct{}{}
+-		docIALCacheKeys[p] = keys
++	if !docIALVersions.fresh(p, token) || cost >= docIALCache.MaxCost() {
++		return false
+ 	}
+-	keys[key] = struct{}{}
++	if _, ok := docIALCache.Get(key); ok {
++		return false
++	}
++	if !storeIALLocked(docIALCache, key, ial, cost) {
++		return false
++	}
++	rememberIALKeyLocked(docIALCacheKeys, p, key)
++	return true
+ }
+ 
+ func GetDocIALInBox(p, boxID string) (ret map[string]string) {
+@@ -75,10 +131,14 @@ func GetDocIALInBox(p, boxID string) (ret map[string]string) {
+ 
+ func RemoveDocIAL(p string) {
+ 	docIALCacheKeysMu.Lock()
++	defer docIALCacheKeysMu.Unlock()
++	docIALVersions.bump(p)
++	removeDocIALLocked(p)
++}
++
++func removeDocIALLocked(p string) {
+ 	keys := docIALCacheKeys[p]
+ 	delete(docIALCacheKeys, p)
+-	docIALCacheKeysMu.Unlock()
+-
+ 	docIALCache.Del(p)
+ 	docIALCache.Del(docIALCacheKey(p, ""))
+ 	for key := range keys {
+@@ -88,22 +148,18 @@ func RemoveDocIAL(p string) {
+ 
+ func RemoveDocIALInBox(p, boxID string) {
+ 	key := docIALCacheKey(p, boxID)
+-	docIALCache.Del(key)
+-
+ 	docIALCacheKeysMu.Lock()
+ 	defer docIALCacheKeysMu.Unlock()
+-	if keys := docIALCacheKeys[p]; keys != nil {
+-		delete(keys, key)
+-		if len(keys) == 0 {
+-			delete(docIALCacheKeys, p)
+-		}
+-	}
++	docIALVersions.bump(p)
++	docIALCache.Del(key)
++	forgetIALKeyLocked(docIALCacheKeys, p, key)
+ }
+ 
+ func ClearDocsIAL() {
+ 	docIALCacheKeysMu.Lock()
++	defer docIALCacheKeysMu.Unlock()
++	docIALVersions.reset()
+ 	docIALCacheKeys = map[string]map[string]struct{}{}
+-	docIALCacheKeysMu.Unlock()
+ 	docIALCache.Clear()
+ }
+ 
+@@ -114,6 +170,7 @@ var blockIALCache, _ = ristretto.NewCache(&ristretto.Config{
+ })
+ var blockIALCacheKeys = map[string]map[string]struct{}{}
+ var blockIALCacheKeysMu sync.Mutex
++var blockIALVersions = newFillVersions() // by block id, whichever of its keys is written
+ 
+ func blockIALCacheKey(id, boxID string) string {
+ 	return boxID + "\x00" + id
+@@ -123,23 +180,46 @@ func PutBlockIAL(id string, ial map[string]string) {
+ 	PutBlockIALInBox(id, "", ial)
+ }
+ 
++// PutBlockIALInBox writes block id's attributes. A write the cache can't hold, for its size or because ristretto turns
++// it away, removes every key of the block instead: reads fall back from the notebook's key to the bare one, and would
++// otherwise serve an older copy.
+ func PutBlockIALInBox(id, boxID string, ial map[string]string) {
+ 	key := blockIALCacheKey(id, boxID)
+ 	cost := ialCacheCost(key, ial)
+-	if cost >= blockIALCache.MaxCost() {
+-		RemoveBlockIALInBox(id, boxID)
++	blockIALCacheKeysMu.Lock()
++	defer blockIALCacheKeysMu.Unlock()
++	blockIALVersions.bump(id)
++	if cost >= blockIALCache.MaxCost() || !storeIALLocked(blockIALCache, key, ial, cost) {
++		removeBlockIALLocked(id)
+ 		return
+ 	}
+-	blockIALCache.Set(key, maps.Clone(ial), cost)
++	rememberIALKeyLocked(blockIALCacheKeys, id, key)
++}
+ 
++// FillBlockIALInBox caches attributes of block id read from its page rootID, as loaded from the file or the page
++// cache, by a reader that took token before it first looked in the cache and loaded the page. It lands only if the
++// block's entry is still missing and, since token, nothing wrote or removed the block and nothing wrote the page or
++// removed it from the page cache (TreeFresh), and reports whether it did. It checks the page under the block cache's
++// lock, taking the page cache's inside it; nothing takes them the other way round.
++func FillBlockIALInBox(id, rootID, boxID string, ial map[string]string, token FillToken) bool {
++	key := blockIALCacheKey(id, boxID)
++	cost := ialCacheCost(key, ial)
+ 	blockIALCacheKeysMu.Lock()
+ 	defer blockIALCacheKeysMu.Unlock()
+-	keys := blockIALCacheKeys[id]
+-	if keys == nil {
+-		keys = map[string]struct{}{}
+-		blockIALCacheKeys[id] = keys
++	if !blockIALVersions.fresh(id, token) || cost >= blockIALCache.MaxCost() {
++		return false
+ 	}
+-	keys[key] = struct{}{}
++	if !TreeFresh(rootID, token) {
++		return false
++	}
++	if _, ok := blockIALCache.Get(key); ok {
++		return false
++	}
++	if !storeIALLocked(blockIALCache, key, ial, cost) {
++		return false
++	}
++	rememberIALKeyLocked(blockIALCacheKeys, id, key)
++	return true
+ }
+ 
+ func GetBlockIAL(id string) (ret map[string]string) {
+@@ -170,10 +250,14 @@ func GetBlockIALWithBoxFallback(id, boxID string) (ret map[string]string) {
+ 
+ func RemoveBlockIAL(id string) {
+ 	blockIALCacheKeysMu.Lock()
++	defer blockIALCacheKeysMu.Unlock()
++	blockIALVersions.bump(id)
++	removeBlockIALLocked(id)
++}
++
++func removeBlockIALLocked(id string) {
+ 	keys := blockIALCacheKeys[id]
+ 	delete(blockIALCacheKeys, id)
+-	blockIALCacheKeysMu.Unlock()
+-
+ 	blockIALCache.Del(id)
+ 	blockIALCache.Del(blockIALCacheKey(id, ""))
+ 	for key := range keys {
+@@ -183,21 +267,17 @@ func RemoveBlockIAL(id string) {
+ 
+ func RemoveBlockIALInBox(id, boxID string) {
+ 	key := blockIALCacheKey(id, boxID)
+-	blockIALCache.Del(key)
+-
+ 	blockIALCacheKeysMu.Lock()
+ 	defer blockIALCacheKeysMu.Unlock()
+-	if keys := blockIALCacheKeys[id]; keys != nil {
+-		delete(keys, key)
+-		if len(keys) == 0 {
+-			delete(blockIALCacheKeys, id)
+-		}
+-	}
++	blockIALVersions.bump(id)
++	blockIALCache.Del(key)
++	forgetIALKeyLocked(blockIALCacheKeys, id, key)
+ }
+ 
+ func ClearBlocksIAL() {
+ 	blockIALCacheKeysMu.Lock()
++	defer blockIALCacheKeysMu.Unlock()
++	blockIALVersions.reset()
+ 	blockIALCacheKeys = map[string]map[string]struct{}{}
+-	blockIALCacheKeysMu.Unlock()
+ 	blockIALCache.Clear()
+ }
+diff --git a/kernel/cache/ial_fill_test.go b/kernel/cache/ial_fill_test.go
+new file mode 100644
+index 0000000..df38fb5
+--- /dev/null
++++ b/kernel/cache/ial_fill_test.go
+@@ -0,0 +1,233 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"fmt"
++	"testing"
++)
++
++// A fill is a read that missed the cache, loaded the file and caches what it read. It takes a FillToken before its
++// first lookup and before it loads, and lands only if nothing wrote or removed the key since.
++
++const fillTestBox, fillTestRoot = "20261016090000-notebk1", "20261016090000-fillrot"
++
++func olderIAL(id string) map[string]string {
++	return map[string]string{"id": id, "custom-object-type": "note"}
++}
++func newerIAL(id string) map[string]string {
++	return map[string]string{"id": id, "custom-object-type": "task"}
++}
++
++func blockFill(id string, ial map[string]string, token FillToken) bool {
++	return FillBlockIALInBox(id, fillTestRoot, fillTestBox, ial, token)
++}
++
++func pageFill(p string, ial map[string]string, token FillToken) bool {
++	return FillDocIALInBox(p, fillTestBox, ial, token)
++}
++
++func readBlock(id string) map[string]string { return GetBlockIALWithBoxFallback(id, fillTestBox) }
++func readPage(p string) map[string]string   { return GetDocIALInBox(p, fillTestBox) }
++
++// A fill that took its token before a write doesn't store, so the write stays: setBlockAttrs, a transaction's
++// binding of a row, an edit's write under the block's bare key, or a page write, landing while the fill loads the
++// file from before it.
++func TestIALFillTakenBeforeWriteDoesNotStore(t *testing.T) {
++	cases := []struct {
++		name  string
++		write func(id string)
++		fill  func(id string, ial map[string]string, token FillToken) bool
++		read  func(id string) map[string]string
++		clear func()
++	}{
++		{"block, notebook-key write", func(id string) { PutBlockIALInBox(id, fillTestBox, newerIAL(id)) },
++			blockFill, readBlock, ClearBlocksIAL},
++		{"block, edit's bare-key write", func(id string) { PutBlockIAL(id, newerIAL(id)) },
++			blockFill, readBlock, ClearBlocksIAL},
++		{"page write", func(p string) { PutDocIALInBox(p, fillTestBox, newerIAL(p)) },
++			pageFill, readPage, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			c.clear()
++			t.Cleanup(c.clear)
++			const id = "20261016090000-fillwrt"
++			token := NewFillToken() // the read missed, and is about to load the file
++			c.write(id)
++			if c.fill(id, olderIAL(id), token) {
++				t.Fatal("a fill that took its token before a write stored the file's older attributes")
++			}
++			if got := c.read(id); "task" != got["custom-object-type"] {
++				t.Fatalf("after a write and a fill that started before it, a read gave %v, not the write", got)
++			}
++		})
++	}
++}
++
++// A remove, or a clear, between a fill's token and its store stops the fill, as a move, a restore or a deletion
++// drops a page's cached attributes while a read of it loads the file from before.
++func TestIALFillAfterRemoveDoesNotStore(t *testing.T) {
++	cases := []struct {
++		name   string
++		remove func(id string)
++		fill   func(id string, ial map[string]string, token FillToken) bool
++		read   func(id string) map[string]string
++		clear  func()
++	}{
++		{"block, removed", RemoveBlockIAL, blockFill, readBlock, ClearBlocksIAL},
++		{"block, removed in its notebook", func(id string) { RemoveBlockIALInBox(id, fillTestBox) },
++			blockFill, readBlock, ClearBlocksIAL},
++		{"block, cache cleared", func(string) { ClearBlocksIAL() }, blockFill, readBlock, ClearBlocksIAL},
++		{"page, removed", RemoveDocIAL, pageFill, readPage, ClearDocsIAL},
++		{"page, removed in its notebook", func(p string) { RemoveDocIALInBox(p, fillTestBox) },
++			pageFill, readPage, ClearDocsIAL},
++		{"page, cache cleared", func(string) { ClearDocsIAL() }, pageFill, readPage, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			c.clear()
++			t.Cleanup(c.clear)
++			const id = "20261016090000-fillrmv"
++			token := NewFillToken()
++			c.remove(id)
++			if c.fill(id, olderIAL(id), token) {
++				t.Fatal("a fill stored after a remove between its token and its store")
++			}
++			if got := c.read(id); nil != got {
++				t.Fatalf("after a remove between a fill's token and its store, a read gave %v rather than missing", got)
++			}
++		})
++	}
++}
++
++// A fill nothing raced stores, a read straight after it gets what it stored, and a second fill of a key the cache
++// holds doesn't replace it.
++func TestIALFillUnracedStoresAtOnce(t *testing.T) {
++	cases := []struct {
++		name  string
++		fill  func(id string, ial map[string]string, token FillToken) bool
++		read  func(id string) map[string]string
++		clear func()
++	}{
++		{"block", blockFill, readBlock, ClearBlocksIAL},
++		{"page", pageFill, readPage, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			c.clear()
++			t.Cleanup(c.clear)
++			const id = "20261016090000-fillok1"
++			if !c.fill(id, newerIAL(id), NewFillToken()) {
++				t.Fatal("a fill nothing raced didn't store")
++			}
++			if got := c.read(id); "task" != got["custom-object-type"] {
++				t.Fatalf("a read straight after a fill gave %v", got)
++			}
++			if c.fill(id, olderIAL(id), NewFillToken()) {
++				t.Fatal("a fill replaced attributes the cache already held")
++			}
++		})
++	}
++}
++
++// A write straight after a fill keeps the write. "+ New" in a filtered view does this to the page it makes: placing
++// the new row renders the view, whose read of the page's attributes fills the cache from its file without custom-avs,
++// and a fraction of a millisecond later the row's binding writes them with custom-avs. A fill left queued in
++// ristretto would turn the write away, as a second put of a key it doesn't hold yet, so fills wait too.
++func TestIALFillThenWriteKeepsWrite(t *testing.T) {
++	cases := []struct {
++		name  string
++		fill  func(id string, ial map[string]string, token FillToken) bool
++		write func(id string, ial map[string]string)
++		read  func(id string) map[string]string
++		wait  func()
++		clear func()
++	}{
++		{"block", blockFill, func(id string, ial map[string]string) { PutBlockIALInBox(id, fillTestBox, ial) },
++			readBlock, blockIALCache.Wait, ClearBlocksIAL},
++		{"page", pageFill, func(p string, ial map[string]string) { PutDocIALInBox(p, fillTestBox, ial) },
++			readPage, docIALCache.Wait, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			c.clear()
++			t.Cleanup(c.clear)
++			for i := range 100 {
++				id := fmt.Sprintf("20261016090000-fillnw%d", i)
++				c.fill(id, olderIAL(id), NewFillToken())
++				c.write(id, newerIAL(id))
++				c.wait() // whatever the cache still has queued, it has now taken in or turned away
++				if got := c.read(id); "task" != got["custom-object-type"] {
++					t.Fatalf("after a fill and then a write of %s, a read gave %v, not the write", id, got)
++				}
++			}
++		})
++	}
++}
++
++// A block fill also checks the page it read the block from: a page write bumps no block's version, so a fill that
++// loaded the page before the write, or while it was being written, could otherwise store the block's older
++// attributes.
++func TestIALBlockFillChecksItsPage(t *testing.T) {
++	const id, root = "20261016090000-fillblk", "20261016090000-fillpge"
++	fill := func(token FillToken) bool { return FillBlockIALInBox(id, root, fillTestBox, olderIAL(id), token) }
++	t.Cleanup(ClearBlocksIAL)
++
++	ClearBlocksIAL()
++	token := NewFillToken()
++	BeginTreeWrite(root)
++	EndTreeWrite(root)
++	if fill(token) {
++		t.Fatal("a block fill whose token came before a write of its page stored")
++	}
++
++	BeginTreeWrite(root)
++	if fill(NewFillToken()) {
++		t.Fatal("a block fill stored while its page was being written")
++	}
++	EndTreeWrite(root)
++
++	token = NewFillToken()
++	RemoveTreeData(root)
++	if fill(token) {
++		t.Fatal("a block fill whose page was removed from the page cache after its token stored")
++	}
++
++	if !fill(NewFillToken()) {
++		t.Fatal("a block fill that took its token after its page's last write didn't store")
++	}
++}
++
++// fillVersions forgets every key once it holds too many, and refuses the fills that began before, so memory stays
++// bounded at the cost of a few refused fills.
++func TestFillVersionsForgetPastTheirLimit(t *testing.T) {
++	v := newFillVersions()
++	token := NewFillToken()
++	for i := range fillVersionsLimit + 1 {
++		v.bump(fmt.Sprintf("key%d", i))
++	}
++	if fillVersionsLimit < len(v.last) {
++		t.Fatalf("fillVersions holds %d keys, past its limit of %d", len(v.last), fillVersionsLimit)
++	}
++	if v.fresh("never-written", token) {
++		t.Fatal("a fill that began before fillVersions forgot its keys was let through")
++	}
++	if !v.fresh("never-written", NewFillToken()) {
++		t.Fatal("a fill that began after fillVersions forgot its keys was refused")
++	}
++}
+diff --git a/kernel/cache/ial_latest_test.go b/kernel/cache/ial_latest_test.go
+new file mode 100644
+index 0000000..2c2ed9c
+--- /dev/null
++++ b/kernel/cache/ial_latest_test.go
+@@ -0,0 +1,115 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/dgraph-io/ristretto"
++)
++
++// Two puts of a block's or a document's attributes back to back, the second before the cache has taken in the first,
++// as making a row with "+ New" does: once both have returned, a read gives the second. ristretto queues a put of a key
++// it doesn't hold yet, and then turns away a second put of that key as one it already holds, so without waiting the
++// read gives the first put's attributes, here a page's from before it was bound to its row.
++func TestIALCacheKeepsLatestPut(t *testing.T) {
++	cases := []struct {
++		name  string
++		put   func(id, boxID string, ial map[string]string)
++		get   func(id, boxID string) map[string]string
++		wait  func()
++		clear func()
++	}{
++		{"block", PutBlockIALInBox, GetBlockIALInBox, blockIALCache.Wait, ClearBlocksIAL},
++		{"document", PutDocIALInBox, GetDocIALInBox, docIALCache.Wait, ClearDocsIAL},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			t.Cleanup(c.clear)
++			for i := range 100 {
++				id := fmt.Sprintf("20261016090000-latest%d", i)
++				c.put(id, "box", map[string]string{"id": id})
++				c.put(id, "box", map[string]string{"id": id, "custom-avs": "20261016090000-database"})
++				c.wait() // whatever the cache still has queued, it has now taken in
++				if got := c.get(id, "box"); got["custom-avs"] != "20261016090000-database" {
++					t.Fatalf("after two puts of %s, a read gave %v, not the second put's attributes", id, got)
++				}
++			}
++		})
++	}
++}
++
++// A write ristretto turns away, here for want of room, leaves no older copy of the block's attributes to read. An
++// edit stores a block's attributes under its bare key; setBlockAttrs then stores newer ones under the block's
++// notebook key. If the cache turns that write away, reads fall back to the bare key and serve the edit's older copy,
++// which still says custom-object-type=note, unless the write drops the block's other keys, so reads go to the file.
++func TestIALCacheTurnedAwayWriteLeavesNoOlderCopy(t *testing.T) {
++	controlled, err := ristretto.NewCache(&ristretto.Config{NumCounters: 100, MaxCost: 2048, BufferItems: 64})
++	if err != nil {
++		t.Fatal(err)
++	}
++	original := blockIALCache
++	blockIALCache = controlled
++	t.Cleanup(func() {
++		ClearBlocksIAL()
++		controlled.Close()
++		blockIALCache = original
++	})
++
++	const id, boxID = "20261016090000-turned1", "20261016090000-notebk1"
++	// Each copy costs more than half the cache, so the cache can't hold both.
++	pad := strings.Repeat("x", 600)
++	older := map[string]string{"id": id, "custom-object-type": "note", "custom-pad": pad}
++	newer := map[string]string{"id": id, "custom-object-type": "task", "custom-pad": pad}
++
++	// Whether ristretto turns the write away depends on its admission policy's timing, so set it up a few times, and
++	// skip rather than fail if it never does: that says nothing about the fix.
++	refused := false
++	for attempt := 0; 5 > attempt && !refused; attempt++ {
++		ClearBlocksIAL()
++		PutBlockIAL(id, older) // an edit's write, under the bare key
++		controlled.Wait()      // without the fix the put is still queued
++		if got := GetBlockIAL(id); got["custom-object-type"] != "note" {
++			continue
++		}
++		// Reads of the edit's copy make it look busier to ristretto's admission policy than a key it has never seen.
++		// The policy counts reads in batches on its own goroutine, and drops a batch while it is busy, so read in
++		// bursts and give it time to count them.
++		for range 20 {
++			for range 256 {
++				GetBlockIAL(id)
++			}
++			time.Sleep(time.Millisecond)
++		}
++		time.Sleep(10 * time.Millisecond)
++
++		PutBlockIALInBox(id, boxID, newer) // setBlockAttrs' write, under the notebook key
++		controlled.Wait()
++		refused = nil == GetBlockIALInBox(id, boxID)
++	}
++	if !refused {
++		t.Skip("ristretto took the write in on every try, so this run can't show what a turned-away write leaves")
++	}
++
++	if got := GetBlockIALWithBoxFallback(id, boxID); nil != got {
++		t.Fatalf("after a write the cache turned away, a read served an older copy, custom-object-type=%q, "+
++			"rather than missing so that it reads the file", got["custom-object-type"])
++	}
++}
+diff --git a/kernel/cache/tree.go b/kernel/cache/tree.go
+index 256ac42..c0f44dd 100644
+--- a/kernel/cache/tree.go
++++ b/kernel/cache/tree.go
+@@ -119,9 +119,45 @@ func SetTreeDataInBox(rootID, boxID string, raw []byte) {
+ 	treeCache.Set(key, entry, int64(cap(entry.raw))+64)
+ }
+ 
++// treeVersions and treeWriting say, per page id, when the page was last written or removed from this cache, and how
++// many writes of its file are under way. A load storing what it read bumps neither, so they tell a block attribute
++// fill whether the page it read the block from may have changed since its FillToken (TreeFresh). treeCacheKeysMu
++// guards them.
++var treeVersions = newFillVersions()
++var treeWriting = map[string]int{}
++
++// BeginTreeWrite and EndTreeWrite bracket a write of page rootID's file. A page write changes its blocks' attributes
++// without bumping their versions, so a block fill checks the page's as well.
++func BeginTreeWrite(rootID string) {
++	treeCacheKeysMu.Lock()
++	defer treeCacheKeysMu.Unlock()
++	treeVersions.bump(rootID)
++	treeWriting[rootID]++
++}
++
++func EndTreeWrite(rootID string) {
++	treeCacheKeysMu.Lock()
++	defer treeCacheKeysMu.Unlock()
++	if n := treeWriting[rootID] - 1; 0 < n {
++		treeWriting[rootID] = n
++	} else {
++		delete(treeWriting, rootID)
++	}
++	treeVersions.bump(rootID)
++}
++
++// TreeFresh reports whether page rootID's file is not being written and nothing wrote it or removed it from this cache
++// since token, so that what a reader that took token loaded from the page is still current.
++func TreeFresh(rootID string, token FillToken) bool {
++	treeCacheKeysMu.Lock()
++	defer treeCacheKeysMu.Unlock()
++	return 0 == treeWriting[rootID] && treeVersions.fresh(rootID, token)
++}
++
+ func RemoveTreeData(rootID string) {
+ 	treeCacheKeysMu.Lock()
+ 	defer treeCacheKeysMu.Unlock()
++	treeVersions.bump(rootID)
+ 	keys := treeCacheKeys[rootID]
+ 	delete(treeCacheKeys, rootID)
+ 
+@@ -136,6 +172,7 @@ func RemoveTreeDataInBox(rootID, boxID string) {
+ 	key := treeCacheKey(rootID, boxID)
+ 	treeCacheKeysMu.Lock()
+ 	defer treeCacheKeysMu.Unlock()
++	treeVersions.bump(rootID)
+ 	treeCache.Del(key)
+ 	if keys := treeCacheKeys[rootID]; keys != nil {
+ 		delete(keys, key)
+@@ -148,6 +185,7 @@ func RemoveTreeDataInBox(rootID, boxID string) {
+ func ClearTreeCache() {
+ 	treeCacheKeysMu.Lock()
+ 	defer treeCacheKeysMu.Unlock()
++	treeVersions.reset()
+ 	treeCacheKeys = map[string]map[string]uint64{}
+ 	treeCache.Clear()
+ }
+diff --git a/kernel/filesys/ial_fill_test.go b/kernel/filesys/ial_fill_test.go
+new file mode 100644
+index 0000000..6c4cfbe
+--- /dev/null
++++ b/kernel/filesys/ial_fill_test.go
+@@ -0,0 +1,73 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"testing"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Writing a page's file refuses the block attribute fills whose readers took their token before it: they may have
++// read the page from before the write, and a page write changes its blocks' attributes without writing them to the
++// block attribute cache. WriteTreeIfUnchanged, which find and replace and asset relinking write with, does the same.
++func TestWriteTreeRefusesBlockFillsTakenBefore(t *testing.T) {
++	cases := []struct {
++		name  string
++		write func(t *testing.T, tree *parse.Tree)
++	}{
++		{"WriteTree", func(t *testing.T, tree *parse.Tree) {
++			tree.Root.SetIALAttr("tags", "written") // a write of the same bytes is skipped, and changes nothing
++			if _, err := WriteTree(tree); err != nil {
++				t.Fatal(err)
++			}
++		}},
++		{"WriteTreeIfUnchanged", func(t *testing.T, tree *parse.Tree) {
++			loaded, original, err := LoadTreeSnapshot(tree.Box, tree.Path, util.NewLute())
++			if err != nil {
++				t.Fatal(err)
++			}
++			loaded.Root.SetIALAttr("tags", "replaced")
++			if _, err = WriteTreeIfUnchanged(loaded, original); err != nil {
++				t.Fatal(err)
++			}
++		}},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			box, root, _, _ := setupStalePathTest(t)
++			t.Cleanup(cache.ClearBlocksIAL)
++			tree := treenode.NewTree(box, "/"+root+".sy", "/Page", "Page")
++			if _, err := WriteTree(tree); err != nil {
++				t.Fatal(err)
++			}
++			attrs := parse.IAL2Map(tree.Root.KramdownIAL)
++
++			token := cache.NewFillToken()
++			c.write(t, tree)
++			if cache.FillBlockIALInBox(tree.ID, tree.ID, box, attrs, token) {
++				t.Fatal("a block fill whose token came before a write of its page stored")
++			}
++			if !cache.FillBlockIALInBox(tree.ID, tree.ID, box, attrs, cache.NewFillToken()) {
++				t.Fatal("a block fill whose token came after the page's write didn't store")
++			}
++		})
++	}
++}
+diff --git a/kernel/filesys/tree.go b/kernel/filesys/tree.go
+index 3053896..adeaca0 100644
+--- a/kernel/filesys/tree.go
++++ b/kernel/filesys/tree.go
+@@ -522,6 +522,9 @@ func WriteTree(tree *parse.Tree) (size uint64, err error) {
+ 		}
+ 	}
+ 
++	// A block attribute fill that read this page from before the write, or while it is under way, must not store.
++	cache.BeginTreeWrite(tree.ID)
++	defer cache.EndTreeWrite(tree.ID)
+ 	if encrypted {
+ 		// 加密密文必须通过临时文件原子替换，避免 mmap 先截断目标后崩溃导致认证密文永久损坏。
+ 		if err = writeTreeByWriteFile(filePath, encData); nil != err {
+diff --git a/kernel/filesys/tree_compare_write.go b/kernel/filesys/tree_compare_write.go
+index e347863..5702bc7 100644
+--- a/kernel/filesys/tree_compare_write.go
++++ b/kernel/filesys/tree_compare_write.go
+@@ -35,6 +35,9 @@ func WriteTreeIfUnchanged(tree *parse.Tree, original []byte) (uint64, error) {
+ 	if err != nil {
+ 		return 0, err
+ 	}
++	// As in WriteTree: a block attribute fill that read this page from before the write must not store.
++	cache.BeginTreeWrite(tree.ID)
++	defer cache.EndTreeWrite(tree.ID)
+ 	if err = util.WriteFileIfUnchanged(filePath, original, diskData); err != nil {
+ 		return 0, err
+ 	}
+diff --git a/kernel/model/blockial.go b/kernel/model/blockial.go
+index 72fa9a4..479c30a 100644
+--- a/kernel/model/blockial.go
++++ b/kernel/model/blockial.go
+@@ -89,7 +89,6 @@ func SetBlockReminder(id, timed string) (err error) {
+ 
+ 	FlushTxQueue()
+ 
+-	attrs := sql.GetBlockAttrs(id)
+ 	tree, err := LoadTreeByBlockID(id)
+ 	if err != nil {
+ 		return
+@@ -114,7 +113,6 @@ func SetBlockReminder(id, timed string) (err error) {
+ 
+ 	attrName := reminderWechatAttr
+ 	if "0" == timed {
+-		delete(attrs, attrName)
+ 		old := node.IALAttr(attrName)
+ 		oldTimedMills, e := dateparse.ParseIn(old, time.Now().Location())
+ 		if nil == e {
+@@ -122,7 +120,6 @@ func SetBlockReminder(id, timed string) (err error) {
+ 		}
+ 		node.RemoveIALAttr(attrName)
+ 	} else {
+-		attrs[attrName] = timed
+ 		node.SetIALAttr(attrName, timed)
+ 		util.PushMsg(fmt.Sprintf(Conf.Language(101), time.UnixMilli(timedMills).Format("2006-01-02 15:04")), 5000)
+ 	}
+@@ -130,7 +127,8 @@ func SetBlockReminder(id, timed string) (err error) {
+ 		return
+ 	}
+ 	IncSync()
+-	cache.PutBlockIALInBox(id, tree.Box, attrs)
++	// The reminder is set on node, the first leaf of a container block, so cache node's attributes as written.
++	cache.PutBlockIALInBox(node.ID, tree.Box, parse.IAL2Map(node.KramdownIAL))
+ 	return
+ }
+ 
+@@ -206,7 +204,6 @@ func BatchSetBlockAttrs(blockAttrs []map[string]any) (err error) {
+ 	for _, change := range docSortModeChanges {
+ 		newAttrs := parse.IAL2Map(change.node.KramdownIAL)
+ 		if change.oldAttrs[DocSortModeAttr] != newAttrs[DocSortModeAttr] && ast.NodeDocument == change.node.Type {
+-			cache.RemoveDocIALInBox(change.tree.Path, change.tree.Box)
+ 			cache.PutDocIALInBox(change.tree.Path, change.tree.Box, newAttrs)
+ 		}
+ 		pushDocSortModeChanged(change.oldAttrs, change.node, change.tree)
+@@ -273,7 +270,6 @@ func setNodeAttrs(node *ast.Node, tree *parse.Tree, nameValues map[string]string
+ 	newAttrs := parse.IAL2Map(node.KramdownIAL)
+ 	cache.PutBlockIALInBox(node.ID, tree.Box, newAttrs)
+ 	if oldAttrs[DocSortModeAttr] != newAttrs[DocSortModeAttr] && ast.NodeDocument == node.Type {
+-		cache.RemoveDocIALInBox(tree.Path, tree.Box)
+ 		cache.PutDocIALInBox(tree.Path, tree.Box, newAttrs)
+ 	}
+ 
+@@ -350,7 +346,6 @@ func setNodeAttrsWithTx(tx *Transaction, node *ast.Node, tree *parse.Tree, nameV
+ 	newAttrs := parse.IAL2Map(node.KramdownIAL)
+ 	cache.PutBlockIALInBox(node.ID, tree.Box, newAttrs)
+ 	if oldAttrs[DocSortModeAttr] != newAttrs[DocSortModeAttr] && ast.NodeDocument == node.Type {
+-		cache.RemoveDocIALInBox(tree.Path, tree.Box)
+ 		cache.PutDocIALInBox(tree.Path, tree.Box, newAttrs)
+ 	}
+ 	pushBlockAttrs(oldAttrs, node)
+diff --git a/kernel/model/box_doc.go b/kernel/model/box_doc.go
+index 7608843..9c0a247 100644
+--- a/kernel/model/box_doc.go
++++ b/kernel/model/box_doc.go
+@@ -229,6 +229,7 @@ func indexBoxDocIfNeeded(boxID, boxDocID string) {
+ 	if nil != treenode.GetBlockTreeInBox(boxDocID, boxID) {
+ 		return
+ 	}
++	token := cache.NewFillToken() // what is cached below is a fill: a write since must not be replaced
+ 	tree, err := filesys.LoadTree(boxID, boxDocPath(boxDocID), util.NewLute())
+ 	if err != nil {
+ 		logging.LogErrorf("load box document [box=%s, id=%s] failed: %s", boxID, boxDocID, err)
+@@ -236,7 +237,7 @@ func indexBoxDocIfNeeded(boxID, boxDocID string) {
+ 	}
+ 	treenode.IndexBlockTree(tree)
+ 	sql.IndexTreeQueue(tree)
+-	cache.PutDocIALInBox(tree.Path, tree.Box, parse.IAL2Map(tree.Root.KramdownIAL))
++	cache.FillDocIALInBox(tree.Path, tree.Box, parse.IAL2Map(tree.Root.KramdownIAL), token)
+ }
+ 
+ func reconcileBoxDoc(box *Box, boxDocID string) error {
+diff --git a/kernel/model/file.go b/kernel/model/file.go
+index 3c24d7f..6683dd4 100644
+--- a/kernel/model/file.go
++++ b/kernel/model/file.go
+@@ -156,6 +156,7 @@ func (box *Box) docIAL(p string) (ret map[string]string) {
+ 		}
+ 	}
+ 
++	token := cache.NewFillToken() // before the first lookup and the file's read
+ 	ret = cache.GetDocIALInBox(p, box.ID)
+ 	if nil != ret {
+ 		return ret
+@@ -187,7 +188,7 @@ func (box *Box) docIAL(p string) (ret map[string]string) {
+ 		box.moveCorruptedData(filePath)
+ 		return nil
+ 	}
+-	cache.PutDocIALInBox(p, box.ID, ret)
++	cache.FillDocIALInBox(p, box.ID, ret, token)
+ 	return ret
+ }
+ 
+diff --git a/kernel/model/import.go b/kernel/model/import.go
+index a58b42d..f78493f 100644
+--- a/kernel/model/import.go
++++ b/kernel/model/import.go
+@@ -1122,6 +1122,8 @@ func importSY0(zipPath, boxID, toPath string, createNotebook, autoDetect bool, s
+ 		p = filepath.ToSlash(p)
+ 		cache.RemoveTreeDataInBox(util.GetTreeID(p), boxID)
+ 		cache.RemoveDocIALInBox(p, boxID)
++		// The import wrote the file itself, and the remove above is that write's; what is cached below is a fill.
++		token := cache.NewFillToken()
+ 		tree, err := filesys.LoadTree(boxID, p, luteEngine)
+ 		if err != nil {
+ 			logging.LogErrorf("load tree [%s] failed: %s", treePath, err)
+@@ -1129,7 +1131,7 @@ func importSY0(zipPath, boxID, toPath string, createNotebook, autoDetect bool, s
+ 		}
+ 
+ 		treenode.IndexBlockTree(tree)
+-		cache.PutDocIALInBox(tree.Path, tree.Box, parse.IAL2Map(tree.Root.KramdownIAL))
++		cache.FillDocIALInBox(tree.Path, tree.Box, parse.IAL2Map(tree.Root.KramdownIAL), token)
+ 		var avNodes []*ast.Node
+ 		for _, avNode := range tree.Root.ChildrenByType(ast.NodeAttributeView) {
+ 			if _, ok := importedAvIDs[avNode.AttributeViewID]; ok {
+diff --git a/kernel/model/index.go b/kernel/model/index.go
+index b47bf2d..07a9339 100644
+--- a/kernel/model/index.go
++++ b/kernel/model/index.go
+@@ -190,6 +190,7 @@ func indexBox(boxID string) {
+ 		treeCount++
+ 		i := treeCount
+ 		lock.Unlock()
++		token := cache.NewFillToken() // what the index caches below is a fill: a write since must not be replaced
+ 		tree, err := filesys.LoadTree(box.ID, file.path, luteEngine)
+ 		if err != nil {
+ 			logging.LogErrorf("read box [%s] tree [%s] failed: %s", box.ID, file.path, err)
+@@ -213,7 +214,7 @@ func indexBox(boxID string) {
+ 		}
+ 		lock.Unlock()
+ 
+-		cache.PutDocIALInBox(file.path, tree.Box, docIAL)
++		cache.FillDocIALInBox(file.path, tree.Box, docIAL, token)
+ 		treenode.IndexBlockTree(tree)
+ 		sql.IndexTreeQueue(tree)
+ 		util.IncBootProgress(bootProgressPart, fmt.Sprintf(Conf.Language(92), util.ShortPathForBootingDisplay(tree.Path)))
+diff --git a/kernel/sql/block.go b/kernel/sql/block.go
+index 2be0cf8..7457593 100644
+--- a/kernel/sql/block.go
++++ b/kernel/sql/block.go
+@@ -381,6 +381,8 @@ func nodeStaticContent(node *ast.Node, excludeTypes []string, includeTextMarkATi
+ 	return buf.String()
+ }
+ 
++// BatchGetBlockAttrsWitTrees reads attributes from trees its caller loaded earlier, maybe before a write the cache has
++// since lost, so it caches nothing it reads from them. Its callers, the kanban and gallery renders, hold the trees.
+ func BatchGetBlockAttrsWitTrees(ids []string, trees map[string]*parse.Tree) (ret map[string]map[string]string) {
+ 	ret = map[string]map[string]string{}
+ 
+@@ -408,13 +410,14 @@ func BatchGetBlockAttrsWitTrees(ids []string, trees map[string]*parse.Tree) (ret
+ 			continue
+ 		}
+ 
+-		ret[id] = getBlockAttrsFromTree(id, tree)
++		ret[id] = getBlockAttrsFromTree(id, tree, nil)
+ 	}
+ 	return
+ }
+ 
+ func BatchGetBlockAttrs(ids []string) (ret map[string]map[string]string) {
+ 	ret = map[string]map[string]string{}
++	token := cache.NewFillToken() // before the first lookup and the trees' load
+ 
+ 	hitCache := true
+ 	for _, id := range ids {
+@@ -441,13 +444,14 @@ func BatchGetBlockAttrs(ids []string) (ret map[string]map[string]string) {
+ 			continue
+ 		}
+ 
+-		ret[id] = getBlockAttrsFromTree(id, tree)
++		ret[id] = getBlockAttrsFromTree(id, tree, &token)
+ 	}
+ 	return
+ }
+ 
+ func GetBlockAttrs(id string) (ret map[string]string) {
+ 	ret = map[string]string{}
++	token := cache.NewFillToken() // before the first lookup and the tree's load
+ 	// 写入端部分路径用 box-aware key、部分用 bare key，这里按 box-aware 优先、bare key 回退查询，
+ 	// 避免漏掉任一命名空间的更新（如块绑定数据库后写 box-aware key，但旧 bare key 仍是绑定前旧值）。
+ 	bt := treenode.GetBlockTree(id)
+@@ -470,11 +474,14 @@ func GetBlockAttrs(id string) (ret map[string]string) {
+ 		return
+ 	}
+ 
+-	ret = getBlockAttrsFromTree(id, tree)
++	ret = getBlockAttrsFromTree(id, tree, &token)
+ 	return
+ }
+ 
+-func getBlockAttrsFromTree(id string, tree *parse.Tree) (ret map[string]string) {
++// getBlockAttrsFromTree reads a block's attributes, from the cache if it holds them, else from tree. What it reads
++// from tree it caches only given token, which its reader took before it first looked in the cache and loaded tree,
++// and then as a fill, which never replaces a write of the block, or of its page, that came after the token.
++func getBlockAttrsFromTree(id string, tree *parse.Tree, token *cache.FillToken) (ret map[string]string) {
+ 	ret = map[string]string{}
+ 
+ 	ial := cache.GetBlockIALWithBoxFallback(id, tree.Box)
+@@ -492,7 +499,9 @@ func getBlockAttrsFromTree(id string, tree *parse.Tree) (ret map[string]string)
+ 	for _, kv := range node.KramdownIAL {
+ 		ret[kv[0]] = html.UnescapeAttrVal(kv[1])
+ 	}
+-	cache.PutBlockIALInBox(id, tree.Box, ret)
++	if nil != token {
++		cache.FillBlockIALInBox(id, tree.ID, tree.Box, ret, *token)
++	}
+ 	return
+ }
+ 
+diff --git a/kernel/sql/ial_fill_test.go b/kernel/sql/ial_fill_test.go
+new file mode 100644
+index 0000000..464aba2
+--- /dev/null
++++ b/kernel/sql/ial_fill_test.go
+@@ -0,0 +1,131 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package sql
++
++import (
++	"fmt"
++	"path/filepath"
++	"testing"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++const fillTestBox = "20261016090000-notebk1"
++
++// A write straight after a read that filled the cache keeps the write. "+ New" in a filtered database view renders the
++// view to place the new row, which reads the new page's attributes from its file (BatchGetBlockAttrs,
++// getBlockAttrsFromTree) and caches them without custom-avs; a fraction of a millisecond later the row's binding
++// writes them with custom-avs. Without the fix ristretto turns that write away, as a second put of a key it doesn't
++// hold yet, and the page reads as bound to no database.
++func TestBlockAttrsFillThenWriteKeepsWrite(t *testing.T) {
++	cache.ClearBlocksIAL()
++	t.Cleanup(cache.ClearBlocksIAL)
++	const avID = "20261016090000-databse"
++	lost := 0
++	for i := range 100 {
++		p := fmt.Sprintf("/20261016090%03d-fillnew.sy", i)
++		tree := treenode.NewTree(fillTestBox, p, "/New row", "New row")
++		token := cache.NewFillToken()
++		if read := getBlockAttrsFromTree(tree.ID, tree, &token); "" == read["id"] {
++			t.Fatalf("setup: the read found no attributes for %s: %v", tree.ID, read)
++		}
++		bound := parse.IAL2Map(tree.Root.KramdownIAL)
++		bound["custom-avs"] = avID
++		cache.PutBlockIALInBox(tree.ID, fillTestBox, bound) // the binding's write, as setNodeAttrsWithTx makes it
++		if avID != cache.GetBlockIALWithBoxFallback(tree.ID, fillTestBox)["custom-avs"] {
++			lost++
++		}
++	}
++	if 0 < lost {
++		t.Fatalf("a write straight after a fill was lost: %d of 100 pages read without custom-avs", lost)
++	}
++}
++
++// A read that took no token before its first lookup caches nothing it reads. The kanban and gallery renders hand
++// BatchGetBlockAttrsWitTrees trees they loaded earlier, which may be older than a write the cache has since lost.
++func TestBatchGetBlockAttrsWitTreesCachesNothing(t *testing.T) {
++	cache.ClearBlocksIAL()
++	t.Cleanup(cache.ClearBlocksIAL)
++	tree := treenode.NewTree(fillTestBox, "/20261016090000-witrees.sy", "/Card", "Card")
++	read := BatchGetBlockAttrsWitTrees([]string{tree.ID}, map[string]*parse.Tree{tree.ID: tree})
++	if "" == read[tree.ID]["id"] {
++		t.Fatalf("setup: the read found no attributes: %v", read)
++	}
++	if got := cache.GetBlockIALWithBoxFallback(tree.ID, fillTestBox); nil != got {
++		t.Fatalf("a read of a tree its caller loaded earlier cached what it read: %v", got)
++	}
++}
++
++// A read that took its token before a write of the block caches nothing: the tree it read the block from is older
++// than the write.
++func TestBlockAttrsFillAfterWriteDoesNotStore(t *testing.T) {
++	cache.ClearBlocksIAL()
++	t.Cleanup(cache.ClearBlocksIAL)
++	tree := treenode.NewTree(fillTestBox, "/20261016090000-raced01.sy", "/Raced", "Raced")
++	token := cache.NewFillToken()
++	written := parse.IAL2Map(tree.Root.KramdownIAL)
++	written["custom-object-type"] = "task"
++	cache.PutBlockIALInBox(tree.ID, fillTestBox, written)
++	cache.RemoveBlockIALInBox(tree.ID, fillTestBox) // the write's entry is gone, evicted say, before the read stores
++	getBlockAttrsFromTree(tree.ID, tree, &token)
++	if got := cache.GetBlockIALWithBoxFallback(tree.ID, fillTestBox); nil != got {
++		t.Fatalf("a read that took its token before a write cached the older tree's attributes: %v", got)
++	}
++}
++
++// The reads that load a page take their token before their first lookup, and so cache what they load: the single
++// read, and the batch read, which a database render makes, "+ New" among them. A read that took no token would cache
++// nothing.
++func TestBlockAttrsReadsFillWhatTheyLoad(t *testing.T) {
++	originalDataDir, originalBlockTreeDBPath := util.DataDir, util.BlockTreeDBPath
++	util.DataDir = t.TempDir()
++	util.BlockTreeDBPath = filepath.Join(t.TempDir(), "blocktree.db")
++	treenode.InitBlockTree(true)
++	t.Cleanup(func() {
++		cache.ClearBlocksIAL()
++		cache.ClearTreeCache()
++		treenode.CloseDatabase()
++		util.DataDir, util.BlockTreeDBPath = originalDataDir, originalBlockTreeDBPath
++	})
++	tree := treenode.NewTree(fillTestBox, "/20261016090000-loaded1.sy", "/Loaded", "Loaded")
++	if _, err := filesys.WriteTree(tree); err != nil {
++		t.Fatal(err)
++	}
++	treenode.UpsertBlockTree(tree)
++
++	for _, c := range []struct {
++		name string
++		read func() map[string]string
++	}{
++		{"GetBlockAttrs", func() map[string]string { return GetBlockAttrs(tree.ID) }},
++		{"BatchGetBlockAttrs", func() map[string]string { return BatchGetBlockAttrs([]string{tree.ID})[tree.ID] }},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			cache.ClearBlocksIAL()
++			if got := c.read(); tree.ID != got["id"] {
++				t.Fatalf("setup: the read gave %v", got)
++			}
++			if got := cache.GetBlockIALInBox(tree.ID, fillTestBox); tree.ID != got["id"] {
++				t.Fatalf("the read didn't cache what it loaded: the cache holds %v", got)
++			}
++		})
++	}
++}
+-- 
+2.53.0
+

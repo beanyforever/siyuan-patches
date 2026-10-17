@@ -1,0 +1,210 @@
+From 7c1440c2edec43e72a306c1f33a79011b8e03ab5 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:31:39 -0400
+Subject: [PATCH] A database read straight after a save gets it from the cache
+
+Each save of a database stores its copy in the database cache under a
+fresh ristretto key and drops the live one at once (replaceAVCacheLocked),
+and ristretto takes a new key in later, on its own goroutine. So
+until it did, every read of the database missed, read its file and stored
+what it read, and the first read after a save opened the same moment again
+as it stored the database's normalized copy, which goes through the same
+store. That moment is when a read that loaded the file before the save can
+store the older copy as the newest.
+
+replaceAVCacheLocked, which saves, the fill after a miss and normalized
+copies all go through, now waits under avSearchDataCacheLock until
+ristretto has taken the new copy in or turned it away, and reports which, so
+SetAVNormalizedDataInBox now says whether its copy was kept rather than
+queued; its one caller doesn't read it. Readers take the lock's read side,
+so none reads before the copy is in. A copy turned away, for want of room,
+still leaves the old one gone, as before, so reads go to the file. The
+database cache sets no callback that could wait on the lock.
+
+Its Go test is TestAVCacheReadAfterSaveHits, in av_save_test.go, which
+reads straight after each of 100 saves, and after each of 100 normalized
+copies; without the patch, on v3.8.7 with 0001 to 0007 applied, every one
+of the 200 reads missed. SiYuan's own TestAVCacheRejectsStaleAsyncAdmission
+paused admission and expected two stores of one database to return while
+both were queued, which can no longer happen, so it hung; it now checks that
+a store doesn't return while admission is paused, and that a read after the
+newer of two stores gets it. Without the patch it fails on the store
+returning.
+
+Still open: a read that misses for another reason, as the first after a
+restart does, can still store a copy older than a save landing meanwhile,
+and a read of a database's history copy by its path stores it as the live
+database.
+---
+ kernel/cache/av.go           | 11 ++++-
+ kernel/cache/av_save_test.go | 78 ++++++++++++++++++++++++++++++++++++
+ kernel/cache/av_test.go      | 28 ++++++++-----
+ 3 files changed, 105 insertions(+), 12 deletions(-)
+ create mode 100644 kernel/cache/av_save_test.go
+
+diff --git a/kernel/cache/av.go b/kernel/cache/av.go
+index 8273c5e..10d5c0c 100644
+--- a/kernel/cache/av.go
++++ b/kernel/cache/av.go
+@@ -121,6 +121,12 @@ func SetAVNormalizedDataInBox(avID, boxID string, version uint64, raw, normalize
+ 
+ // replaceAVCacheLocked 使用独立准入键，让增长的条目参与淘汰，并隔离旧条目的异步写入及删除。
+ // 调用方必须持有 avSearchDataCacheLock。
++//
++// It returns once ristretto has taken the new copy in or turned it away, and reports which. The old copy goes at
++// once and ristretto takes a new key in later, on its own goroutine, so without waiting, a read straight after a save
++// would miss, read the file and store what it read. Readers take the lock's read side, so none reads before the new
++// copy is in. A copy turned away, for want of room, leaves none, so reads go to the file. The database cache sets no
++// callback that could wait on the lock.
+ func replaceAVCacheLocked(avID, key string, entry *avCacheEntry, cost int64) bool {
+ 	keys := avCacheKeys[avID]
+ 	if keys == nil {
+@@ -134,7 +140,10 @@ func replaceAVCacheLocked(avID, key string, entry *avCacheEntry, cost int64) boo
+ 	if previous != 0 {
+ 		avCache.Del(previous)
+ 	}
+-	return avCache.Set(cacheKey, entry, cost)
++	avCache.Set(cacheKey, entry, cost)
++	avCache.Wait()
++	_, ok := avCache.Get(cacheKey)
++	return ok
+ }
+ 
+ func EnsureAVDataVersionInBox(avID, boxID string) (version uint64) {
+diff --git a/kernel/cache/av_save_test.go b/kernel/cache/av_save_test.go
+new file mode 100644
+index 0000000..e991b08
+--- /dev/null
++++ b/kernel/cache/av_save_test.go
+@@ -0,0 +1,78 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"bytes"
++	"fmt"
++	"testing"
++)
++
++// A read straight after a database save gets the save from the cache. Each save stores its copy under a fresh
++// ristretto key and drops the live one at once, and ristretto takes the new key in later, so without the fix a read in
++// between misses, reads the file and stores what it read: the moment in which a read that loaded the file before a
++// save can store the older copy as the newest. The first save of a database, and every save after it, are checked, and
++// so is the normalized copy the first parse after a save stores the same way.
++func TestAVCacheReadAfterSaveHits(t *testing.T) {
++	const avID, boxID = "20261016090000-avsaved", "20261016090000-notebk1"
++	t.Run("save", func(t *testing.T) {
++		ClearAVCache()
++		t.Cleanup(ClearAVCache)
++		misses := 0
++		for i := range 100 {
++			raw := []byte(fmt.Sprintf(`{"name":"save %d"}`, i))
++			version := SetAVDataWithVersionInBox(avID, boxID, raw)
++			got, gotVersion, ok := GetAVDataWithVersionInBox(avID, boxID)
++			if !ok {
++				misses++
++				continue
++			}
++			if !bytes.Equal(got, raw) || gotVersion != version {
++				t.Fatalf("save %d: a read straight after it got %q (version %d), not the save (version %d)", i, got, gotVersion, version)
++			}
++		}
++		if 0 < misses {
++			t.Fatalf("a read straight after a save missed the cache, and would read the file, after %d of 100 saves", misses)
++		}
++	})
++	t.Run("normalized copy", func(t *testing.T) {
++		ClearAVCache()
++		t.Cleanup(ClearAVCache)
++		misses := 0
++		for i := range 100 {
++			raw := []byte(fmt.Sprintf(`{"name":"save %d"}`, i))
++			version := SetAVDataWithVersionInBox(avID, boxID, raw)
++			avCache.Wait() // the save itself is in, whatever the fix to it
++			normalized := []byte(fmt.Sprintf(`{"name":"save %d","normalized":true}`, i))
++			if !SetAVNormalizedDataInBox(avID, boxID, version, raw, normalized) {
++				t.Fatalf("save %d: the normalized copy wasn't stored", i)
++			}
++			got, ok := GetAVNormalizedDataInBox(avID, boxID, version)
++			_, _, rawOK := GetAVDataWithVersionInBox(avID, boxID)
++			if !ok || !rawOK {
++				misses++
++				continue
++			}
++			if !bytes.Equal(got, normalized) {
++				t.Fatalf("save %d: a read straight after storing the normalized copy got %q", i, got)
++			}
++		}
++		if 0 < misses {
++			t.Fatalf("a read straight after storing a normalized copy missed the cache after %d of 100 saves", misses)
++		}
++	})
++}
+diff --git a/kernel/cache/av_test.go b/kernel/cache/av_test.go
+index 0eb886a..0c2a79d 100644
+--- a/kernel/cache/av_test.go
++++ b/kernel/cache/av_test.go
+@@ -19,6 +19,7 @@ package cache
+ import (
+ 	"bytes"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/dgraph-io/ristretto"
+ )
+@@ -154,21 +155,26 @@ func TestAVCacheRejectsStaleAsyncAdmission(t *testing.T) {
+ 		controlled.Close()
+ 		avCache = original
+ 	})
+-	// 暂停准入线程，让同一数据库的两次写入都在首次缓存建立前入队。
+-	SetAVDataInBox("blocker", "box", []byte{})
++	// A store returns only once its copy is taken in or turned away, so with admission paused it doesn't return, and
++	// two stores of one database can never both be queued before the first is taken in.
++	stored := make(chan struct{})
++	go func() {
++		SetAVDataInBox("blocker", "box", []byte{})
++		close(stored)
++	}()
+ 	<-entered
++	select {
++	case <-stored:
++		close(release)
++		t.Fatal("a store returned while admission was paused")
++	case <-time.After(50 * time.Millisecond):
++	}
++	close(release)
++	<-stored
+ 	SetAVDataInBox("database", "box", []byte("old"))
+ 	latestVersion := SetAVDataWithVersionInBox("database", "box", []byte("latest"))
+-	close(release)
+-	controlled.Wait()
+-	if raw, version, ok := GetAVDataWithVersionInBox("database", "box"); ok && (!bytes.Equal(raw, []byte("latest")) || version != latestVersion) {
+-		t.Fatalf("returned stale database after a newer write: %q", raw)
+-	}
+-	// 未命中后重新读取源文件，可以恢复当前版本的缓存。
+-	latestVersion = SetAVDataWithVersionInBox("database", "box", []byte("latest"))
+-	controlled.Wait()
+ 	if raw, version, ok := GetAVDataWithVersionInBox("database", "box"); !ok || !bytes.Equal(raw, []byte("latest")) || version != latestVersion {
+-		t.Fatalf("latest database was not cached: %q, %v", raw, ok)
++		t.Fatalf("a read after the newer store got %q, %v, not the newer copy", raw, ok)
+ 	}
+ }
+ 
+-- 
+2.53.0
+

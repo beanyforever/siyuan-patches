@@ -16,7 +16,7 @@ ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg \
     go test -tags "fts5 sqlcipher" ./mcp/ \
     && go test -tags "fts5 sqlcipher" -run '^TestAttributeViewPropertyGuard|^TestSystemPageGuard|^TestMoveToAnotherNotebookAndBackKeepsEdits|^TestMoveAfterEditReadsNewType|^TestRollbackDocHistoryRestoresAttributes|^TestRollbackRepoSnapshotFileRestoresAttributes' ./model/ \
-    && go test -tags "fts5 sqlcipher" -run '^TestIALCacheKeepsLatestPut|^TestIALCacheTurnedAwayWriteLeavesNoOlderCopy|^TestIALFill|^TestIALBlockFill|^TestFillVersions|^TestTreeFill' ./cache/ \
+    && go test -tags "fts5 sqlcipher" -run '^TestIALCacheKeepsLatestPut|^TestIALCacheTurnedAwayWriteLeavesNoOlderCopy|^TestIALFill|^TestIALBlockFill|^TestFillVersions|^TestTreeFill|^TestAV' ./cache/ \
     && go test -tags "fts5 sqlcipher" -run '^TestBlockAttrsFill|^TestBlockAttrsReadsFillWhatTheyLoad|^TestBatchGetBlockAttrsWitTreesCachesNothing' ./sql/ \
     && go test -tags "fts5 sqlcipher" -run '^TestWriteTreeRefusesBlockFillsTakenBefore|^TestTreeFill' ./filesys/ \
     && go build -tags "fts5 sqlcipher" -ldflags "-s -w"

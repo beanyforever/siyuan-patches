@@ -1,0 +1,4164 @@
+From 84a81a2c9171ca1642e793f475fb52d64cc21dd7 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 03:38:22 -0400
+Subject: [PATCH] Writers outside WriteTree and saveAttributeView raise what
+ they wrote
+
+Patch 0005 gives each page and database a version that WriteTree,
+WriteTreeIfUnchanged, fixTreeJSONData's write-back and saveAttributeView
+raise, so a cache serves no copy older than their writes. Many other
+writers put pages and databases on disk without them: the file API
+(putFile, copies, renames, removes), the archive API's unzip, the MCP
+file tool, imports, notebook mount and removal, moves across notebooks,
+snapshot restores, sync and checkout, the user-guide mount and WebDAV.
+After those, the caches kept serving the copy from before, and the next
+edit could save it over the file.
+
+- cache.RaisePages and cache.RaiseAVs raise a page or database without
+  dropping anything, under the version map's own leaf lock, and
+  cache.RaiseAll raises an epoch below which nothing noted is served.
+  A database no reader has noted is skipped.
+- filesys.RaiseForDataPath raises what a path under data/ names: a .sy
+  its page, storage/av/<id>.json its database, a folder everything it
+  holds after a walk, and data/ itself everything. BeginDataPathWrite
+  brackets a remove, raising what the paths held before and after, and
+  at a folder's end raises again whatever was raised since it began, so
+  a page written into the folder meanwhile is caught.
+  RaiseForDataCopy raises what a copy brought.
+- About 60 call sites raise after their write, or bracket it, whether
+  or not it succeeded. Moves have no code of their own: their renames
+  raise both paths. Sync, checkout and asset recovery raise everything
+  on each file dejavu writes or removes, since its events name no
+  path, and raise the merge's removed files after; a failed sync or
+  checkout, a data.zip import and the user-guide mount raise
+  everything.
+
+Rolling a page back to a snapshot it already matched, while the page
+was cached, removed its file and then had WriteTree skip the write as
+unchanged, leaving no file; the raise at the remove makes WriteTree
+write it.
+
+Left open: with on-demand asset downloads, a page a sync removes stays
+served until the sync returns, since dejavu removes it with no event
+(its test skips that mode); a write that began before a folder remove
+and ends after it can still cache the removed page, which needs writers
+to take turns; and the CLI writes in its own process.
+
+The patch carries 30 Go tests, each through what SiYuan serves. Of the
+ones written before the fix, a writer per kind of bypass, Doc2Heading's
+source page, a data.zip import, a sync download and a full checkout
+fail without it on v3.8.7 with patches 0001 to 0005, and so does the
+snapshot rollback. The rest check a sync read while it uploads, a
+folder remove racing a write, by a single writer, a bulk writer and in
+a folder larger than the version map, a copy through a link, and the
+raises themselves.
+---
+ kernel/api/archive.go                         |  10 +-
+ kernel/api/export.go                          |   6 +-
+ kernel/api/file.go                            |  26 +-
+ kernel/api/outside_writers_test.go            | 402 ++++++++++++++
+ kernel/cache/fill.go                          |  17 +-
+ kernel/cache/raise.go                         | 117 ++++
+ kernel/cache/raise_test.go                    | 248 +++++++++
+ kernel/filesys/challenge_step4_round1_test.go | 157 ++++++
+ kernel/filesys/challenge_step4_test.go        |  81 +++
+ kernel/filesys/raise.go                       | 240 ++++++++
+ kernel/filesys/raise_test.go                  | 232 ++++++++
+ kernel/harmony/kernel.go                      |   7 +-
+ .../mcp/tools/challenge_step4_round1_test.go  |  41 ++
+ kernel/mcp/tools/challenge_step4_test.go      |  47 ++
+ kernel/mcp/tools/file.go                      |  22 +-
+ kernel/mcp/tools/outside_writers_test.go      | 294 ++++++++++
+ kernel/mcp/tools/unzip.go                     |   8 +-
+ kernel/mobile/kernel.go                       |   6 +-
+ kernel/model/asset_download.go                |   6 +-
+ kernel/model/asset_download_recovery.go       |   2 +
+ kernel/model/assets.go                        |   8 +-
+ kernel/model/attribute_view.go                |  14 +-
+ kernel/model/attribute_view_create.go         |   3 +
+ kernel/model/attribute_view_transaction.go    |   4 +-
+ kernel/model/box.go                           |  22 +-
+ kernel/model/challenge_step4_fts5_test.go     | 328 +++++++++++
+ kernel/model/conf.go                          |   6 +-
+ kernel/model/crypto.go                        |   2 +-
+ kernel/model/duplicate_doc_tree.go            |   5 +-
+ kernel/model/file.go                          |  13 +-
+ kernel/model/history.go                       |  13 +-
+ kernel/model/import.go                        |  22 +-
+ kernel/model/import_obsidian.go               |   5 +-
+ kernel/model/index_fix.go                     |   7 +-
+ kernel/model/mount.go                         |  20 +-
+ kernel/model/notebook_archive.go              |   8 +-
+ kernel/model/notebook_archive_import.go       |   6 +-
+ kernel/model/notebook_bundle.go               |   2 +-
+ kernel/model/outside_writers_fts5_test.go     | 513 ++++++++++++++++++
+ kernel/model/raise_fts5_test.go               | 131 +++++
+ kernel/model/repository.go                    |  39 +-
+ kernel/model/sync_perception.go               |  23 +
+ kernel/server/serve.go                        |  32 +-
+ 43 files changed, 3135 insertions(+), 60 deletions(-)
+ create mode 100644 kernel/api/outside_writers_test.go
+ create mode 100644 kernel/cache/raise.go
+ create mode 100644 kernel/cache/raise_test.go
+ create mode 100644 kernel/filesys/challenge_step4_round1_test.go
+ create mode 100644 kernel/filesys/challenge_step4_test.go
+ create mode 100644 kernel/filesys/raise.go
+ create mode 100644 kernel/filesys/raise_test.go
+ create mode 100644 kernel/mcp/tools/challenge_step4_round1_test.go
+ create mode 100644 kernel/mcp/tools/challenge_step4_test.go
+ create mode 100644 kernel/mcp/tools/outside_writers_test.go
+ create mode 100644 kernel/model/challenge_step4_fts5_test.go
+ create mode 100644 kernel/model/outside_writers_fts5_test.go
+ create mode 100644 kernel/model/raise_fts5_test.go
+
+diff --git a/kernel/api/archive.go b/kernel/api/archive.go
+index 2a281bd..8325a4b 100644
+--- a/kernel/api/archive.go
++++ b/kernel/api/archive.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/88250/gulu"
+ 	"github.com/gin-gonic/gin"
+ 	"github.com/siyuan-note/logging"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ 	"golang.org/x/text/encoding/simplifiedchinese"
+@@ -145,6 +146,8 @@ var zip = contractHandler(apicontract.Zip, func(c *gin.Context, request apicontr
+ 		ret.Msg = err.Error()
+ 		return contractFailure[apicontract.Null](ret)
+ 	}
++	// The archive may land on any path, a page or database file among them: raise it once it is written.
++	defer filesys.RaiseForDataPath(resolvedZipPath)
+ 	zipFile, err := gulu.Zip.Create(resolvedZipPath)
+ 	if err != nil {
+ 		logging.LogErrorf("create zip [%s] failed: %s", zipAbsFilePath, err)
+@@ -250,7 +253,12 @@ func unzipWorkspaceArchive(zipPath, destination string) error {
+ 		if err = validateArchiveEntryPath(destination, paths[i]); err != nil {
+ 			return err
+ 		}
+-		if err = extractWorkspaceArchiveEntry(entry, paths[i]); err != nil {
++		err = extractWorkspaceArchiveEntry(entry, paths[i])
++		if !entry.FileInfo().IsDir() {
++			// The entry bypasses WriteTree and saveAttributeView: raise the page or database it wrote.
++			filesys.RaiseForDataPath(paths[i])
++		}
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/kernel/api/export.go b/kernel/api/export.go
+index 7063c49..a4e4581 100644
+--- a/kernel/api/export.go
++++ b/kernel/api/export.go
+@@ -35,6 +35,7 @@ import (
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/apicontract"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+@@ -962,5 +963,8 @@ func copyExportFileToDestination(src, dest string) (err error) {
+ 	}
+ 	tmpClosed = true
+ 
+-	return os.Rename(tmpPath, dest)
++	err = os.Rename(tmpPath, dest)
++	// dest may be any path, a page or database file among them: raise what the rename replaced.
++	filesys.RaiseForDataPath(dest)
++	return err
+ }
+diff --git a/kernel/api/file.go b/kernel/api/file.go
+index 0cc3fa4..fae8200 100644
+--- a/kernel/api/file.go
++++ b/kernel/api/file.go
+@@ -35,6 +35,7 @@ import (
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/apicontract"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+@@ -222,7 +223,10 @@ var globalCopyFiles = contractHandler(apicontract.GlobalCopyFiles, func(c *gin.C
+ 			ret.Msg = "destination path is a symlink, which is not supported"
+ 			return contractFailure[apicontract.Null](ret)
+ 		}
+-		if err := filelock.Copy(src, dest); err != nil {
++		err := filelock.Copy(src, dest)
++		// The copy bypasses WriteTree and saveAttributeView: raise the pages and databases it wrote.
++		filesys.RaiseForDataCopy(src, dest)
++		if err != nil {
+ 			logging.LogErrorf("copy file [%s] to [%s] failed: %s", src, dest, err)
+ 			ret.Code = -1
+ 			ret.Msg = err.Error()
+@@ -327,7 +331,9 @@ var workspaceCopyFiles = contractHandler(apicontract.WorkspaceCopyFiles, func(c
+ 			ret.Msg = "destination path is a symlink, which is not supported"
+ 			return contractFailure[apicontract.Null](ret)
+ 		}
+-		if err := filelock.Copy(absSrc, dest); err != nil {
++		err := filelock.Copy(absSrc, dest)
++		filesys.RaiseForDataCopy(absSrc, dest)
++		if err != nil {
+ 			logging.LogErrorf("copy file [%s] to [%s] failed: %s", absSrc, dest, err)
+ 			ret.Code = -1
+ 			ret.Msg = err.Error()
+@@ -409,7 +415,9 @@ var copyFile = contractHandler(apicontract.CopyFile, func(c *gin.Context, reques
+ 		return contractFailure[apicontract.Null](ret)
+ 	}
+ 
+-	if err = filelock.Copy(src, dest); err != nil {
++	err = filelock.Copy(src, dest)
++	filesys.RaiseForDataCopy(src, dest)
++	if err != nil {
+ 		logging.LogErrorf("copy file [%s] to [%s] failed: %s", src, dest, err)
+ 		ret.Code = -1
+ 		ret.Msg = err.Error()
+@@ -711,7 +719,10 @@ var renameFile = contractHandler(apicontract.RenameFile, func(c *gin.Context, re
+ 		}
+ 	}
+ 
+-	if err := filelock.RenameWithoutFatal(srcAbsPath, destAbsPath); err != nil {
++	err = filelock.RenameWithoutFatal(srcAbsPath, destAbsPath)
++	// The rename bypasses WriteTree and saveAttributeView: raise what it moved, under both paths.
++	filesys.RaiseForDataPath(srcAbsPath, destAbsPath)
++	if err != nil {
+ 		logging.LogErrorf("rename file failed: %s", err)
+ 		ret.Code = http.StatusInternalServerError
+ 		ret.Msg = http.StatusText(http.StatusInternalServerError) + errMsgSeeKernelLog
+@@ -763,7 +774,10 @@ var removeFile = contractHandler(apicontract.RemoveFile, func(c *gin.Context, re
+ 	}
+ 	affectsSync := model.PathsAffectSync(fileAbsPath)
+ 
+-	if err = filelock.RemoveWithoutFatal(fileAbsPath); err != nil {
++	endWrite := filesys.BeginDataPathWrite(fileAbsPath)
++	err = filelock.RemoveWithoutFatal(fileAbsPath)
++	endWrite()
++	if err != nil {
+ 		logging.LogErrorf("remove [%s] failed: %s", fileAbsPath, err)
+ 		ret.Code = http.StatusInternalServerError
+ 		ret.Msg = http.StatusText(http.StatusInternalServerError) + errMsgSeeKernelLog
+@@ -874,6 +888,8 @@ var putFile = contractHandler(apicontract.PutFile, func(c *gin.Context, request
+ 			}
+ 
+ 			err = filelock.WriteFile(fileAbsPath, data)
++			// The write bypasses WriteTree and saveAttributeView: raise the page or database it wrote.
++			filesys.RaiseForDataPath(fileAbsPath)
+ 			if err != nil {
+ 				logging.LogErrorf("write file [%s] failed: %s", fileAbsPath, err)
+ 				break
+diff --git a/kernel/api/outside_writers_test.go b/kernel/api/outside_writers_test.go
+new file mode 100644
+index 0000000..28da7b8
+--- /dev/null
++++ b/kernel/api/outside_writers_test.go
+@@ -0,0 +1,402 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package api
++
++import (
++	archivezip "archive/zip"
++	"bytes"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/gin-gonic/gin"
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/model"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// The file API writes a workspace's files raw: putFile, the copies, renameFile, removeFile and the archive API's unzip
++// write a page's .sy or a database's storage/av/<id>.json without WriteTree or saveAttributeView, so nothing raises the
++// version of the page or database they write. A page or database SiYuan read before keeps its cache entries current,
++// and SiYuan serves them, older than the file, until something else writes it: getBlockAttrs and a page load give the
++// page as it was, and every read of the database gives it as it was. The next edit, which builds on that copy, then
++// saves it over the file, losing what the API wrote. Each test below caches a page and a database through SiYuan's own
++// reads, writes them through one of these handlers, and reads them back through what SiYuan serves.
++
++const (
++	outsideBoxID  = "20261017210000-outsbox"
++	outsidePageID = "20261017210001-outpage"
++	outsideAVID   = "20261017210002-outdtbs"
++)
++
++// outsideWriterFixture is a workspace with one notebook, holding one page whose root has custom-v=old, and one
++// database named Old table. Both have been read through SiYuan's own reads after a restart, so the page cache, the block
++// attribute cache and the database cache hold them, as they do once anything has shown them.
++type outsideWriterFixture struct {
++	pagePath    string // the page's file, relative to the workspace
++	avPath      string // the database's file, relative to the workspace
++	newPage     []byte // the page's file with custom-v=new
++	newDatabase []byte // the database's file named New table
++}
++
++func setupOutsideWriterTest(t *testing.T) *outsideWriterFixture {
++	t.Helper()
++	gin.SetMode(gin.TestMode)
++	previousConf := model.Conf
++	previousWorkspace, previousData, previousTemp := util.WorkspaceDir, util.DataDir, util.TempDir
++	previousHistory, previousConfDir, previousBlockTree := util.HistoryDir, util.ConfDir, util.BlockTreeDBPath
++	workspace := t.TempDir()
++	util.WorkspaceDir = workspace
++	util.DataDir = filepath.Join(workspace, "data")
++	util.TempDir = filepath.Join(workspace, "temp")
++	util.HistoryDir = filepath.Join(workspace, "history")
++	util.ConfDir = filepath.Join(workspace, "conf")
++	util.BlockTreeDBPath = filepath.Join(util.TempDir, "blocktree.db")
++	for _, dir := range []string{util.TempDir, util.ConfDir} {
++		if err := os.MkdirAll(dir, 0755); nil != err {
++			t.Fatal(err)
++		}
++	}
++	model.Conf = model.NewAppConf()
++	model.Conf.FileTree.Store(conf.NewFileTree())
++	model.Conf.Sync.Store(conf.NewSync())
++	model.Conf.NotebookCrypto = conf.NewNotebookCrypto()
++	treenode.InitBlockTree(true)
++	clearCaches := func() {
++		cache.ClearTreeCache()
++		cache.ClearBlocksIAL()
++		cache.ClearDocsIAL()
++		cache.RemoveAVData(outsideAVID)
++	}
++	t.Cleanup(func() {
++		clearCaches()
++		treenode.CloseDatabase()
++		model.Conf = previousConf
++		util.WorkspaceDir, util.DataDir, util.TempDir = previousWorkspace, previousData, previousTemp
++		util.HistoryDir, util.ConfDir, util.BlockTreeDBPath = previousHistory, previousConfDir, previousBlockTree
++	})
++
++	box := &model.Box{ID: outsideBoxID}
++	boxConf := conf.NewBoxConf()
++	boxConf.Name = "Work"
++	boxConf.Closed = false
++	if err := box.SaveConf(boxConf); nil != err {
++		t.Fatalf("setup: save the notebook's conf failed: %v", err)
++	}
++	tree := treenode.NewTree(outsideBoxID, "/"+outsidePageID+".sy", "/Page", "Page")
++	tree.Root.SetIALAttr("custom-v", "old")
++	if _, err := filesys.WriteTree(tree); nil != err {
++		t.Fatalf("setup: write the page failed: %v", err)
++	}
++	treenode.UpsertBlockTree(tree)
++	attrView := &av.AttributeView{ID: outsideAVID, Spec: av.RichTextSpec, Name: "Old table",
++		KeyValues: []*av.KeyValues{{Key: &av.Key{ID: "20261017210003-blockky", Name: "Name", Type: av.KeyTypeBlock}}},
++		Views: []*av.View{{ID: "20261017210004-tablevw", Name: "Table", LayoutType: av.LayoutTypeTable,
++			Table: av.NewLayoutTable(), PageSize: av.ViewDefaultPageSize}},
++		RenderedViewables: map[string]av.Viewable{}}
++	if err := av.SaveAttributeView(attrView); nil != err {
++		t.Fatalf("setup: save the database failed: %v", err)
++	}
++
++	f := &outsideWriterFixture{
++		pagePath: filepath.ToSlash(filepath.Join("data", outsideBoxID, outsidePageID+".sy")),
++		avPath:   filepath.ToSlash(filepath.Join("data", "storage", "av", outsideAVID+".json")),
++	}
++	f.newPage = replaceOutsideJSONString(t, readOutsideFile(t, f.pagePath), "custom-v", "old", "new")
++	f.newDatabase = replaceOutsideJSONString(t, readOutsideFile(t, f.avPath), "name", "Old table", "New table")
++
++	// As after a restart, then SiYuan's own reads: getBlockAttrs loads the page, which fills the page cache and the
++	// block attribute cache, and a read of the database fills the database cache. One read each: a second fill of a
++	// key ristretto hasn't taken in yet is turned away, and the page cache then serves neither copy.
++	clearCaches()
++	if got := sql.GetBlockAttrs(outsidePageID)["custom-v"]; "old" != got {
++		t.Fatalf("setup: getBlockAttrs gives the page custom-v=%q", got)
++	}
++	if attrView, err := av.ParseAttributeView(outsideAVID); nil != err || "Old table" != attrView.Name {
++		t.Fatalf("setup: the database reads %v, %v", attrView, err)
++	}
++	waitOutsideCached(t, "the page cache doesn't serve the page", func() bool {
++		_, ok := cache.GetTreeDataInBox(outsidePageID, outsideBoxID)
++		return ok
++	})
++	waitOutsideCached(t, "the block attribute cache doesn't serve the page's attributes", func() bool {
++		return nil != cache.GetBlockIALInBox(outsidePageID, outsideBoxID)
++	})
++	waitOutsideCached(t, "the database cache doesn't serve the database", func() bool {
++		_, ok := cache.GetAVData(outsideAVID)
++		return ok
++	})
++	return f
++}
++
++// waitOutsideCached waits up to 200 ms for the cache to take in what a read stored: ristretto takes a store in on a
++// goroutine of its own, and a read straight after it would miss and read the file, which would hide the fault.
++func waitOutsideCached(t *testing.T, what string, cached func() bool) {
++	t.Helper()
++	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
++		if cached() {
++			return
++		}
++	}
++	t.Fatalf("setup: %s", what)
++}
++
++func readOutsideFile(t *testing.T, workspacePath string) []byte {
++	t.Helper()
++	data, err := os.ReadFile(filepath.Join(util.WorkspaceDir, filepath.FromSlash(workspacePath)))
++	if nil != err {
++		t.Fatalf("read %s failed: %v", workspacePath, err)
++	}
++	return data
++}
++
++// replaceOutsideJSONString replaces "name":"old" with "name":"new" in a file SiYuan wrote, on one line or indented.
++func replaceOutsideJSONString(t *testing.T, data []byte, name, old, new string) []byte {
++	t.Helper()
++	for _, separator := range []string{":", ": "} {
++		from := []byte(`"` + name + `"` + separator + `"` + old + `"`)
++		if bytes.Contains(data, from) {
++			return bytes.Replace(data, from, []byte(`"`+name+`"`+separator+`"`+new+`"`), 1)
++		}
++	}
++	t.Fatalf("setup: the file holds no %q: %q", name, old)
++	return nil
++}
++
++// stageOutsideFile writes data at a workspace path outside data/, where nothing caches, for a handler to copy, rename
++// or unzip from.
++func stageOutsideFile(t *testing.T, workspacePath string, data []byte) string {
++	t.Helper()
++	absPath := filepath.Join(util.WorkspaceDir, filepath.FromSlash(workspacePath))
++	if err := os.MkdirAll(filepath.Dir(absPath), 0755); nil != err {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(absPath, data, 0644); nil != err {
++		t.Fatal(err)
++	}
++	return absPath
++}
++
++// requireOutsideFileHolds stops the test unless the file at workspacePath holds "name":"value": a writer under test
++// that wrote nothing would make every read look stale.
++func requireOutsideFileHolds(t *testing.T, step, workspacePath, name, value string) {
++	t.Helper()
++	data := readOutsideFile(t, workspacePath)
++	for _, separator := range []string{":", ": "} {
++		if bytes.Contains(data, []byte(`"`+name+`"`+separator+`"`+value+`"`)) {
++			return
++		}
++	}
++	t.Fatalf("%s: %s doesn't hold %s=%q", step, workspacePath, name, value)
++}
++
++// checkOutsidePage reads the page as SiYuan serves it, through getBlockAttrs and a page load, and wants custom-v=want,
++// which its file holds.
++func checkOutsidePage(t *testing.T, step, want string) {
++	t.Helper()
++	requireOutsideFileHolds(t, step, "data/"+outsideBoxID+"/"+outsidePageID+".sy", "custom-v", want)
++	if got := sql.GetBlockAttrs(outsidePageID)["custom-v"]; want != got {
++		t.Errorf("%s: getBlockAttrs gives the page custom-v=%q, though its file holds %q", step, got, want)
++	}
++	tree, err := filesys.LoadTree(outsideBoxID, "/"+outsidePageID+".sy", util.NewLute())
++	if nil != err {
++		t.Errorf("%s: load the page failed: %v", step, err)
++		return
++	}
++	if got := tree.Root.IALAttr("custom-v"); want != got {
++		t.Errorf("%s: the page loads with custom-v=%q, though its file holds %q", step, got, want)
++	}
++}
++
++// checkOutsideDatabase reads the database as every operation on it starts, and wants its name to be want, which its
++// file holds.
++func checkOutsideDatabase(t *testing.T, step, want string) {
++	t.Helper()
++	requireOutsideFileHolds(t, step, "data/storage/av/"+outsideAVID+".json", "name", want)
++	attrView, err := av.ParseAttributeView(outsideAVID)
++	if nil != err || nil == attrView {
++		t.Errorf("%s: read the database failed: %v", step, err)
++		return
++	}
++	if want != attrView.Name {
++		t.Errorf("%s: the database reads with the name %q, though its file holds %q", step, attrView.Name, want)
++	}
++}
++
++// callOutsideWriterAPI calls handler as an administrator and wants it to succeed.
++func callOutsideWriterAPI(t *testing.T, route string, handler gin.HandlerFunc, contentType string, body []byte) {
++	t.Helper()
++	engine := gin.New()
++	engine.Use(func(c *gin.Context) {
++		c.Set(model.RoleContextKey, model.RoleAdministrator)
++		c.Next()
++	})
++	engine.POST(route, handler)
++	recorder := httptest.NewRecorder()
++	request := httptest.NewRequest(http.MethodPost, route, bytes.NewReader(body))
++	request.Header.Set("Content-Type", contentType)
++	engine.ServeHTTP(recorder, request)
++	var response struct {
++		Code int    `json:"code"`
++		Msg  string `json:"msg"`
++	}
++	if err := json.Unmarshal(recorder.Body.Bytes(), &response); nil != err || 0 != response.Code {
++		t.Fatalf("%s failed: %s, %v", route, recorder.Body.String(), err)
++	}
++}
++
++func outsideJSONBody(t *testing.T, value any) []byte {
++	t.Helper()
++	data, err := json.Marshal(value)
++	if nil != err {
++		t.Fatal(err)
++	}
++	return data
++}
++
++// /api/file/putFile over a page's file and over a database's file. On v3.8.7 and step 3 the handler writes with
++// filelock.WriteFile and raises nothing.
++func TestPutFileServesTheFileItWrote(t *testing.T) {
++	t.Run("a page", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		body, contentType := putFileMultipartBody(t, f.pagePath, f.newPage)
++		callOutsideWriterAPI(t, "/api/file/putFile", putFile, contentType, body)
++		checkOutsidePage(t, "after putFile", "new")
++	})
++	t.Run("a database", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		body, contentType := putFileMultipartBody(t, f.avPath, f.newDatabase)
++		callOutsideWriterAPI(t, "/api/file/putFile", putFile, contentType, body)
++		checkOutsideDatabase(t, "after putFile", "New table")
++	})
++}
++
++// The file API's copies, raw copies with filelock.Copy: /api/file/workspaceCopyFiles of a page's file and of a
++// database's file, and /api/file/globalCopyFiles of a whole notebook folder over the notebook, which writes the page
++// inside it. None raises anything on v3.8.7 and step 3.
++func TestCopiedFilesServeTheCopy(t *testing.T) {
++	t.Run("a page, by workspaceCopyFiles", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		stageOutsideFile(t, "stage/"+outsidePageID+".sy", f.newPage)
++		callOutsideWriterAPI(t, "/api/file/workspaceCopyFiles", workspaceCopyFiles, "application/json",
++			outsideJSONBody(t, map[string]any{"srcs": []string{"stage/" + outsidePageID + ".sy"},
++				"destDir": "data/" + outsideBoxID}))
++		checkOutsidePage(t, "after workspaceCopyFiles", "new")
++	})
++	t.Run("a notebook folder, by globalCopyFiles", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		stageOutsideFile(t, "stage/"+outsideBoxID+"/"+outsidePageID+".sy", f.newPage)
++		folder := filepath.Join(util.WorkspaceDir, "stage", outsideBoxID)
++		callOutsideWriterAPI(t, "/api/file/globalCopyFiles", globalCopyFiles, "application/json",
++			outsideJSONBody(t, map[string]any{"srcs": []string{folder}, "destDir": "data"}))
++		checkOutsidePage(t, "after globalCopyFiles of the notebook's folder", "new")
++	})
++	t.Run("a database, by workspaceCopyFiles", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		stageOutsideFile(t, "stage/"+outsideAVID+".json", f.newDatabase)
++		callOutsideWriterAPI(t, "/api/file/workspaceCopyFiles", workspaceCopyFiles, "application/json",
++			outsideJSONBody(t, map[string]any{"srcs": []string{"stage/" + outsideAVID + ".json"},
++				"destDir": "data/storage/av"}))
++		checkOutsideDatabase(t, "after workspaceCopyFiles", "New table")
++	})
++}
++
++// /api/file/renameFile of a new copy into the place of a page's file and of a database's file, the way a writer
++// replaces a file whole. renameFile refuses an existing destination, so the old file is first deleted by another
++// program, which SiYuan doesn't see; nothing reads in between. On v3.8.7 and step 3, filelock.RenameWithoutFatal raises
++// nothing.
++func TestRenamedFilesServeTheFileRenamedIn(t *testing.T) {
++	t.Run("a page", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		stageOutsideFile(t, "stage/"+outsidePageID+".sy", f.newPage)
++		if err := os.Remove(filepath.Join(util.WorkspaceDir, filepath.FromSlash(f.pagePath))); nil != err {
++			t.Fatal(err)
++		}
++		callOutsideWriterAPI(t, "/api/file/renameFile", renameFile, "application/json",
++			outsideJSONBody(t, map[string]any{"path": "stage/" + outsidePageID + ".sy", "newPath": f.pagePath}))
++		checkOutsidePage(t, "after renameFile", "new")
++	})
++	t.Run("a database", func(t *testing.T) {
++		f := setupOutsideWriterTest(t)
++		stageOutsideFile(t, "stage/"+outsideAVID+".json", f.newDatabase)
++		if err := os.Remove(filepath.Join(util.WorkspaceDir, filepath.FromSlash(f.avPath))); nil != err {
++			t.Fatal(err)
++		}
++		callOutsideWriterAPI(t, "/api/file/renameFile", renameFile, "application/json",
++			outsideJSONBody(t, map[string]any{"path": "stage/" + outsideAVID + ".json", "newPath": f.avPath}))
++		checkOutsideDatabase(t, "after renameFile", "New table")
++	})
++}
++
++// /api/file/removeFile of a page's file. The block index still lists the page, so getBlockAttrs looks it up; its
++// file holds nothing, so it must give no attributes. On v3.8.7 and step 3, filelock.RemoveWithoutFatal raises nothing,
++// and getBlockAttrs serves the attributes cached before the removal. (A page load checks that the file exists, and a
++// database read too, so those two already read the removal.)
++func TestRemovedPageServesNoAttributes(t *testing.T) {
++	f := setupOutsideWriterTest(t)
++	callOutsideWriterAPI(t, "/api/file/removeFile", removeFile, "application/json",
++		outsideJSONBody(t, map[string]any{"path": f.pagePath}))
++	if _, err := os.Stat(filepath.Join(util.WorkspaceDir, filepath.FromSlash(f.pagePath))); !os.IsNotExist(err) {
++		t.Fatalf("setup: removeFile left the page's file: %v", err)
++	}
++	if got := sql.GetBlockAttrs(outsidePageID); 0 < len(got) {
++		t.Errorf("after removeFile, getBlockAttrs gives the page the attributes %v, though its file is gone", got)
++	}
++}
++
++// /api/archive/unzip of an archive holding a new copy of the page and of the database into data/. On v3.8.7 and
++// step 3, unzipWorkspaceArchive writes each entry with os.Create and raises nothing.
++func TestUnzippedFilesServeTheArchivesCopy(t *testing.T) {
++	f := setupOutsideWriterTest(t)
++	zipPath := filepath.Join(util.TempDir, "payload.zip")
++	file, err := os.Create(zipPath)
++	if nil != err {
++		t.Fatal(err)
++	}
++	writer := archivezip.NewWriter(file)
++	for name, data := range map[string][]byte{
++		outsideBoxID + "/" + outsidePageID + ".sy": f.newPage,
++		"storage/av/" + outsideAVID + ".json":      f.newDatabase,
++	} {
++		entry, createErr := writer.Create(name)
++		if nil != createErr {
++			t.Fatal(createErr)
++		}
++		if _, err = entry.Write(data); nil != err {
++			t.Fatal(err)
++		}
++	}
++	if err = writer.Close(); nil != err {
++		t.Fatal(err)
++	}
++	if err = file.Close(); nil != err {
++		t.Fatal(err)
++	}
++	callOutsideWriterAPI(t, "/api/archive/unzip", unzip, "application/json",
++		outsideJSONBody(t, map[string]any{"zipPath": "temp/payload.zip", "path": "data"}))
++	checkOutsidePage(t, "after unzip", "new")
++	checkOutsideDatabase(t, "after unzip", "New table")
++}
+diff --git a/kernel/cache/fill.go b/kernel/cache/fill.go
+index d63eb5d..c5a0d1d 100644
+--- a/kernel/cache/fill.go
++++ b/kernel/cache/fill.go
+@@ -25,7 +25,8 @@ import (
+ 
+ // Every entry of the page cache and of the block and page attribute caches knows which version of its page's file it
+ // copies. A page's version is the reading of one clock, which only rises, taken at the page's last raise: a write of
+-// its file raises it at both ends (BeginTreeWrite, EndTreeWrite), and so does dropping a cached copy of it. A reader
++// its file raises it at both ends (BeginTreeWrite, EndTreeWrite), and so does dropping a cached copy of it, and any
++// other write of the file raises it once it has finished (raise.go). A reader
+ // notes the clock (NewFillToken) before its first lookup, and what it loads from a file it caches with that token; a
+ // write caches what it wrote with the version EndTreeWrite returned. A cache serves an entry only if nothing raised its
+ // page since (fresh), the read check; otherwise the read misses and goes to the file. A store never raises a version,
+@@ -58,6 +59,7 @@ type fillVersions struct {
+ 	mu        sync.RWMutex
+ 	last      map[string]uint64 // id -> the clock's value at its last raise
+ 	forgotten []uint64          // bucket -> the newest last raise of the ids forgotten into it
++	all       uint64            // the clock's value at the last raise of every id at once (raiseAll)
+ }
+ 
+ func newFillVersions() *fillVersions {
+@@ -81,12 +83,21 @@ func (v *fillVersions) end(id string, begin FillToken) FillToken {
+ 	defer v.mu.Unlock()
+ 	last, ok := v.last[id]
+ 	version := v.bumpLocked(id)
+-	if !ok || last != uint64(begin) {
++	if !ok || last != uint64(begin) || v.all > uint64(begin) {
+ 		return 0
+ 	}
+ 	return version
+ }
+ 
++// bumpAll raises the version of every id at once, those never raised and those forgotten included, without touching
++// the map: an entry noted before it is refused for whichever id it copies, and a write under way when it happens
++// caches nothing.
++func (v *fillVersions) bumpAll() {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	v.all = fillClock.Add(1)
++}
++
+ func (v *fillVersions) bumpLocked(id string) FillToken {
+ 	if _, ok := v.last[id]; !ok && fillVersionsLimit <= len(v.last) {
+ 		v.forgetOldestLocked()
+@@ -104,7 +115,7 @@ func (v *fillVersions) fresh(id string, token FillToken) bool {
+ 	if !ok {
+ 		last = v.forgotten[v.bucket(id)]
+ 	}
+-	return last <= uint64(token)
++	return last <= uint64(token) && v.all <= uint64(token)
+ }
+ 
+ func (v *fillVersions) bucket(id string) uint64 {
+diff --git a/kernel/cache/raise.go b/kernel/cache/raise.go
+new file mode 100644
+index 0000000..44e548b
+--- /dev/null
++++ b/kernel/cache/raise.go
+@@ -0,0 +1,117 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++// A write that changes a page's or a database's file without WriteTree or saveAttributeView (a raw copy, a rename, a
++// remove, an unzip, a restore, a sync) raises what it wrote once the write has finished. Raised before, a fill could
++// note the new version and then read the old file. A raise only moves versions: it drops no entry and touches no floor,
++// and it takes no lock but the version map's own, a leaf, so a writer may raise while holding any of its locks.
++
++// RaisePages raises the version of each page, so no copy of it, of its blocks' attributes or of its own attributes
++// noted before is served after.
++func RaisePages(rootIDs ...string) {
++	if 1 > len(rootIDs) {
++		return
++	}
++	treeVersions.mu.Lock()
++	defer treeVersions.mu.Unlock()
++	for _, rootID := range rootIDs {
++		if "" != rootID {
++			treeVersions.bumpLocked(rootID)
++		}
++	}
++}
++
++// AVKey names a database's file: database AVID of notebook BoxID, where BoxID is "" for data/storage/av.
++type AVKey struct {
++	AVID  string
++	BoxID string
++}
++
++// RaiseAVs raises the version of each database, so no copy of it, normalized copy or search info noted before is
++// served after. A database no reader has noted a version for has nothing cached that could be served, and is skipped,
++// which keeps the version map to the databases read.
++func RaiseAVs(keys ...AVKey) {
++	if 1 > len(keys) {
++		return
++	}
++	avSearchDataCacheLock.Lock()
++	defer avSearchDataCacheLock.Unlock()
++	for _, k := range keys {
++		key := avCacheKey(k.AVID, k.BoxID)
++		if _, ok := avDataVersions[key]; ok {
++			invalidateAVSearchDataByKeyLocked(key)
++		}
++	}
++}
++
++// RaiseChangedSince raises again every page and database whose version rose after since. A write that can take files
++// away (a folder's remove) notes since before it begins, and raises this way once it has finished, so a page written
++// into the folder while the remove ran, which no walk of the folder finds, is raised too. It touches only what was
++// written or dropped while the write ran, scanning the version maps once:
++//   - every id in the map whose version rose;
++//   - every bucket whose value rose, since a page raised during the write may have been forgotten into its bucket
++//     since, as when the write's own end raised more pages than the map remembers;
++//   - the epoch, if it rose: a bulk writer raised everything, and a page it wrote into the folder has no id in the map.
++//
++// With a full map it costs a few hundred microseconds, once per folder remove.
++func RaiseChangedSince(since FillToken) {
++	treeVersions.mu.Lock()
++	var rootIDs []string
++	for rootID, version := range treeVersions.last {
++		if version > uint64(since) {
++			rootIDs = append(rootIDs, rootID)
++		}
++	}
++	for _, rootID := range rootIDs {
++		treeVersions.bumpLocked(rootID)
++	}
++	for b, version := range treeVersions.forgotten {
++		if version > uint64(since) {
++			treeVersions.forgotten[b] = fillClock.Add(1)
++		}
++	}
++	if treeVersions.all > uint64(since) {
++		treeVersions.all = fillClock.Add(1)
++	}
++	treeVersions.mu.Unlock()
++
++	avSearchDataCacheLock.Lock()
++	defer avSearchDataCacheLock.Unlock()
++	var keys []string
++	for key, version := range avDataVersions {
++		if version > uint64(since) {
++			keys = append(keys, key)
++		}
++	}
++	for _, key := range keys {
++		invalidateAVSearchDataByKeyLocked(key)
++	}
++}
++
++// RaiseAll raises every page and every database at once, for a writer that changes more than it can name: a sync, a
++// full snapshot checkout, a data.zip import, the user guide's mount. Pages get one epoch shared by the page cache and
++// the block and page attribute caches, so it isn't a clear: the caches keep their entries and their own floors.
++func RaiseAll() {
++	treeVersions.bumpAll()
++
++	avSearchDataCacheLock.Lock()
++	defer avSearchDataCacheLock.Unlock()
++	for key := range avDataVersions {
++		invalidateAVSearchDataByKeyLocked(key)
++	}
++}
+diff --git a/kernel/cache/raise_test.go b/kernel/cache/raise_test.go
+new file mode 100644
+index 0000000..ba9f9f4
+--- /dev/null
++++ b/kernel/cache/raise_test.go
+@@ -0,0 +1,248 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package cache
++
++import (
++	"testing"
++)
++
++const (
++	raiseTestBox   = "20261017120000-raisebx"
++	raiseTestOther = "20261017120000-raiseot"
++)
++
++// fillAVForRaiseTest caches a database's copy, normalized copy and search info as a fill does: at the version it noted
++// before its lookup.
++func fillAVForRaiseTest(t *testing.T, avID, boxID string, version uint64) {
++	t.Helper()
++	raw := []byte(`{"id":"` + avID + `"}`)
++	SetAVDataInBox(avID, boxID, raw, version)
++	avCache.Wait()
++	if !SetAVNormalizedDataInBox(avID, boxID, version, raw, raw) {
++		t.Fatalf("database %s's normalized copy wasn't stored at the current version", avID)
++	}
++	if !SetAVSearchDataInBox(avID, boxID, version, "info") {
++		t.Fatalf("database %s's search info wasn't stored at the current version", avID)
++	}
++	avCache.Wait()
++}
++
++// servedAV reports whether the database's copy, normalized copy and search info are served.
++func servedAV(avID, boxID string, version uint64) (raw, normalized, search bool) {
++	_, _, raw = GetAVDataWithVersionInBox(avID, boxID)
++	_, normalized = GetAVNormalizedDataInBox(avID, boxID, version)
++	_, search = GetAVSearchDataInBox[string](avID, boxID)
++	return
++}
++
++// Raising a page refuses every copy of it noted before, in the three caches that copy pages, and only of it: another
++// page's copies are still served, and a copy noted after the raise is served.
++func TestRaisingAPageMakesOnlyItsCopiesMiss(t *testing.T) {
++	t.Cleanup(clearVersionTestCaches)
++	const raised, other = "20261017120000-raised1", "20261017120000-other01"
++	noted := NewFillToken()
++	storeVersionTestPage(raised, noted)
++	storeVersionTestPage(other, noted)
++
++	RaisePages(raised, "")
++
++	if page, block, doc := servedVersionTestPage(raised); page || block || doc {
++		t.Fatalf("copies of a raised page noted before the raise were served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	if page, block, doc := servedVersionTestPage(other); !page || !block || !doc {
++		t.Fatalf("raising one page made another's copies miss: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	storeVersionTestPage(raised, NewFillToken())
++	if page, block, doc := servedVersionTestPage(raised); !page || !block || !doc {
++		t.Fatalf("copies noted after the raise weren't served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++}
++
++// Raising a database refuses its copy, normalized copy and search info noted before, in its own notebook only.
++func TestRaisingADatabaseMakesOnlyItsCopiesMiss(t *testing.T) {
++	t.Cleanup(ClearAVCache)
++	const raised, other = "20261017120000-raiseav", "20261017120000-otherav"
++	raisedVersion := EnsureAVDataVersionInBox(raised, raiseTestBox)
++	otherBoxVersion := EnsureAVDataVersionInBox(raised, raiseTestOther)
++	otherVersion := EnsureAVDataVersionInBox(other, raiseTestBox)
++	fillAVForRaiseTest(t, raised, raiseTestBox, raisedVersion)
++	fillAVForRaiseTest(t, raised, raiseTestOther, otherBoxVersion)
++	fillAVForRaiseTest(t, other, raiseTestBox, otherVersion)
++
++	RaiseAVs(AVKey{AVID: raised, BoxID: raiseTestBox})
++
++	if raw, normalized, search := servedAV(raised, raiseTestBox, raisedVersion); raw || normalized || search {
++		t.Fatalf("a raised database's copies were served: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++	if raw, normalized, search := servedAV(raised, raiseTestOther, otherBoxVersion); !raw || !normalized || !search {
++		t.Fatalf("raising a database made its copy in another notebook miss: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++	if raw, normalized, search := servedAV(other, raiseTestBox, otherVersion); !raw || !normalized || !search {
++		t.Fatalf("raising a database made another's copies miss: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++
++	// A fill that noted the version before the raise and stores after it isn't served.
++	SetAVDataInBox(raised, raiseTestBox, []byte(`{}`), raisedVersion)
++	avCache.Wait()
++	if _, _, ok := GetAVDataWithVersionInBox(raised, raiseTestBox); ok {
++		t.Fatal("a database copy noted before the raise and stored after it was served")
++	}
++}
++
++// A database no reader has noted gets no version from a raise, so raising every database a folder holds doesn't grow
++// the version map with databases nobody reads.
++func TestRaisingADatabaseNeverReadAddsNoVersion(t *testing.T) {
++	t.Cleanup(ClearAVCache)
++	const avID = "20261017120000-neverrd"
++	RaiseAVs(AVKey{AVID: avID})
++	avSearchDataCacheLock.RLock()
++	_, ok := avDataVersions[avCacheKey(avID, "")]
++	avSearchDataCacheLock.RUnlock()
++	if ok {
++		t.Fatal("raising a database never read gave it a version")
++	}
++}
++
++// RaiseAll refuses every page's and every database's copies noted before it, raises no cache's own floor, and serves
++// what is noted after it.
++func TestRaisingEverythingRefusesEveryOlderCopy(t *testing.T) {
++	t.Cleanup(func() {
++		clearVersionTestCaches()
++		ClearAVCache()
++	})
++	const rootID, avID = "20261017120000-allpage", "20261017120000-allavdb"
++	noted := NewFillToken()
++	storeVersionTestPage(rootID, noted)
++	avVersion := EnsureAVDataVersionInBox(avID, "")
++	fillAVForRaiseTest(t, avID, "", avVersion)
++	floors := [3]uint64{treeCacheFloor.floor.Load(), blockIALCacheFloor.floor.Load(), docIALCacheFloor.floor.Load()}
++
++	RaiseAll()
++
++	if page, block, doc := servedVersionTestPage(rootID); page || block || doc {
++		t.Fatalf("page copies noted before RaiseAll were served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	if raw, normalized, search := servedAV(avID, "", avVersion); raw || normalized || search {
++		t.Fatalf("database copies noted before RaiseAll were served: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++	if after := [3]uint64{treeCacheFloor.floor.Load(), blockIALCacheFloor.floor.Load(), docIALCacheFloor.floor.Load()}; after != floors {
++		t.Fatalf("RaiseAll moved a cache's own floor: %v, then %v", floors, after)
++	}
++
++	storeVersionTestPage(rootID, NewFillToken())
++	if page, block, doc := servedVersionTestPage(rootID); !page || !block || !doc {
++		t.Fatalf("page copies noted after RaiseAll weren't served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	avVersion = EnsureAVDataVersionInBox(avID, "")
++	fillAVForRaiseTest(t, avID, "", avVersion)
++	if raw, normalized, search := servedAV(avID, "", avVersion); !raw || !normalized || !search {
++		t.Fatalf("database copies noted after RaiseAll weren't served: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++}
++
++// A write of a page or a database under way when its version is raised from outside caches nothing, as when another
++// write overlaps it: the outside writer may have written the file after it.
++func TestWritesOverlappingARaiseCacheNothing(t *testing.T) {
++	t.Cleanup(ClearAVCache)
++	const rootID, avID = "20261017120000-overlap", "20261017120000-overlav"
++	for name, raise := range map[string]func(){
++		"page raised": func() { RaisePages(rootID) },
++		"all raised":  RaiseAll,
++	} {
++		t.Run(name, func(t *testing.T) {
++			begin := BeginTreeWrite(rootID)
++			raise()
++			if version := EndTreeWrite(rootID, begin); 0 != version {
++				t.Fatalf("a page write overlapping a raise may cache at version %d", version)
++			}
++			begin = BeginTreeWrite(rootID)
++			if version := EndTreeWrite(rootID, begin); 0 == version {
++				t.Fatal("a page write after the raise may cache nothing")
++			}
++		})
++	}
++	for name, raise := range map[string]func(){
++		"database raised": func() { RaiseAVs(AVKey{AVID: avID}) },
++		"all raised":      RaiseAll,
++	} {
++		t.Run(name, func(t *testing.T) {
++			begin := BeginAVWrite(avID, "")
++			raise()
++			if version := EndAVWrite(avID, "", begin); 0 != version {
++				t.Fatalf("a database save overlapping a raise may cache at version %d", version)
++			}
++			begin = BeginAVWrite(avID, "")
++			if version := EndAVWrite(avID, "", begin); 0 == version {
++				t.Fatal("a database save after the raise may cache nothing")
++			}
++		})
++	}
++}
++
++// RaiseChangedSince raises again only what rose after its token: a page written since is refused, even the copy its
++// write stored, while a page and a database untouched since keep being served.
++func TestRaisingWhatChangedSinceATokenLeavesTheRest(t *testing.T) {
++	t.Cleanup(func() {
++		clearVersionTestCaches()
++		ClearAVCache()
++	})
++	const untouched, written = "20261018120000-untouch", "20261018120000-written"
++	const quietAV, savedAV = "20261018120000-quietav", "20261018120000-savedav"
++	storeVersionTestPage(untouched, NewFillToken())
++	quietVersion := EnsureAVDataVersionInBox(quietAV, "")
++	fillAVForRaiseTest(t, quietAV, "", quietVersion)
++
++	since := NewFillToken()
++	begin := BeginTreeWrite(written)
++	storeVersionTestPage(written, EndTreeWrite(written, begin))
++	saveAVData(savedAV, "", []byte(`{"id":"`+savedAV+`"}`))
++	avCache.Wait()
++
++	RaiseChangedSince(since)
++
++	if page, block, doc := servedVersionTestPage(written); page || block || doc {
++		t.Fatalf("a page written since the token was served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	if _, _, ok := GetAVDataWithVersionInBox(savedAV, ""); ok {
++		t.Fatal("a database saved since the token was served")
++	}
++	if page, block, doc := servedVersionTestPage(untouched); !page || !block || !doc {
++		t.Fatalf("a page untouched since the token was refused: page %v, block %v, page attributes %v", page, block, doc)
++	}
++	if raw, normalized, search := servedAV(quietAV, "", quietVersion); !raw || !normalized || !search {
++		t.Fatalf("a database untouched since the token was refused: raw %v, normalized %v, search info %v", raw, normalized, search)
++	}
++}
++
++// A page cached after a raise of everything, during a bracket, has no id in the version map; RaiseChangedSince raises
++// the epoch again, so its copy is refused too.
++func TestRaisingWhatChangedSinceCoversARaiseOfEverything(t *testing.T) {
++	t.Cleanup(clearVersionTestCaches)
++	const bulk = "20261018130000-bulkpge"
++	since := NewFillToken()
++	RaiseAll()
++	storeVersionTestPage(bulk, NewFillToken())
++	if page, block, doc := servedVersionTestPage(bulk); !page || !block || !doc {
++		t.Fatalf("setup: a page cached after the raise wasn't served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++
++	RaiseChangedSince(since)
++
++	if page, block, doc := servedVersionTestPage(bulk); page || block || doc {
++		t.Fatalf("a page cached after a raise of everything since the token was served: page %v, block %v, page attributes %v", page, block, doc)
++	}
++}
+diff --git a/kernel/filesys/challenge_step4_round1_test.go b/kernel/filesys/challenge_step4_round1_test.go
+new file mode 100644
+index 0000000..8faeafe
+--- /dev/null
++++ b/kernel/filesys/challenge_step4_round1_test.go
+@@ -0,0 +1,157 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"fmt"
++	"hash/fnv"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Step 4's challenger, fix round 1: the folder bracket's RaiseChangedSince scans only the version map's ids. A page
++// written into the folder during the remove escapes it when its version rose without an entry in the map: through the
++// epoch of a bulk raise (RaiseAll), or because the bounded map forgot it into a bucket before the scan.
++
++// waitRaiseTestCached waits up to 200 ms for ristretto to take in the page cache's store of page id.
++func waitRaiseTestCached(t *testing.T, box, id string) {
++	t.Helper()
++	for deadline := time.Now().Add(200 * time.Millisecond); ; time.Sleep(time.Millisecond) {
++		if _, ok := cache.GetTreeDataInBox(id, box); ok {
++			return
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("setup: the page cache doesn't serve page %s", id)
++		}
++	}
++}
++
++// checkRemovedPageNotServed wants the page the remove took away served by nobody: the page cache refuses its entry, and
++// a save of the page as it was writes its file rather than skip it as already written.
++func checkRemovedPageNotServed(t *testing.T, tree *parse.Tree) {
++	t.Helper()
++	absPath := filepath.Join(util.DataDir, tree.Box, tree.Path)
++	if _, err := os.Stat(absPath); !os.IsNotExist(err) {
++		t.Fatalf("setup: the remove left the page's file: %v", err)
++	}
++	if _, ok := cache.GetTreeDataInBox(tree.ID, tree.Box); ok {
++		t.Error("after the remove, the page cache serves the page written into the folder during it, whose file the " +
++			"remove took away")
++	}
++	if _, err := WriteTree(tree); nil != err {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(absPath); nil != err {
++		t.Errorf("a save of the page as it was, after the remove, wrote no file: %v", err)
++	}
++}
++
++// A bulk writer (a sync's or a checkout's file event, a data.zip import, the user guide's mount, any raw write over
++// data/) can't name what it writes, so it raises everything at once: RaiseAll moves the epoch and puts no page in the
++// version map. A page such a writer puts into a folder while the folder's remove runs, and that a read then caches, has
++// no entry in the map above the bracket's start, so RaiseChangedSince doesn't raise it, and the remove takes its file.
++func TestRemovingAFolderRaisesAPageABulkWriterPutInItDuringTheRemove(t *testing.T) {
++	box, parent, _, _ := setupStalePathTest(t)
++	folder := filepath.Join(util.DataDir, box, parent)
++	existing := treenode.NewTree(box, "/"+parent+"/20261018050001-existng.sy", "/Parent/Existing", "Existing")
++	if _, err := WriteTree(existing); nil != err {
++		t.Fatal(err)
++	}
++	// The page's bytes as WriteTree writes them, taken from a copy in another notebook, so that a save of the page later
++	// compares equal to what a read of its file caches.
++	const otherBox = "20261018050000-otherbx"
++	late := treenode.NewTree(otherBox, "/"+parent+"/20261018050002-bulkpge.sy", "/Parent/Bulk", "Bulk")
++	if _, err := WriteTree(late); nil != err {
++		t.Fatal(err)
++	}
++	data, err := os.ReadFile(filepath.Join(util.DataDir, otherBox, late.Path))
++	if nil != err {
++		t.Fatal(err)
++	}
++	late.Box = box
++
++	end := BeginDataPathWrite(folder)
++	// The bulk writer writes the page into the folder and raises everything, then a read caches the page.
++	if err = os.WriteFile(filepath.Join(util.DataDir, box, late.Path), data, 0644); nil != err {
++		t.Fatal(err)
++	}
++	cache.RaiseAll()
++	if _, err = LoadTree(box, late.Path, util.NewLute()); nil != err {
++		t.Fatal(err)
++	}
++	waitRaiseTestCached(t, box, late.ID)
++	if err = os.RemoveAll(folder); nil != err {
++		t.Fatal(err)
++	}
++	end()
++
++	checkRemovedPageNotServed(t, late)
++}
++
++// The version map remembers 32,768 ids; past that it forgets the eighth raised longest ago into buckets. A folder's end
++// first raises every page its walks noted, then calls RaiseChangedSince. When the folder holds more pages than the map
++// remembers (a notebook of that size, or a page with that many sub-pages), that first raise forgets the page written
++// into the folder during the remove, the oldest raise in the map, into its bucket, and RaiseChangedSince, which scans
++// only the map's ids, never raises it again. Its bucket keeps the version its write cached, so the page cache serves
++// it. The folder's pages here are chosen so none shares the written page's bucket, which another forgotten id raised
++// later would otherwise raise by chance (one time in about 16).
++func TestRemovingALargeFolderRaisesAPageWrittenIntoItDuringTheRemove(t *testing.T) {
++	box, parent, _, _ := setupStalePathTest(t)
++	folder := filepath.Join(util.DataDir, box, parent)
++	if err := os.MkdirAll(folder, 0755); nil != err {
++		t.Fatal(err)
++	}
++	bucket := func(id string) uint64 {
++		h := fnv.New64a()
++		h.Write([]byte(id))
++		return h.Sum64() % (1 << 16)
++	}
++	late := treenode.NewTree(box, "/"+parent+"/20261018060000-largepg.sy", "/Parent/Large", "Large")
++	lateBucket := bucket(late.ID)
++	const pages = 33000
++	for i, n := 0, 0; n < pages; i++ {
++		id := fmt.Sprintf("20261018%06d-a%06d", i, i)
++		if lateBucket == bucket(id) {
++			continue
++		}
++		if err := os.WriteFile(filepath.Join(folder, id+".sy"), []byte("{}"), 0644); nil != err {
++			t.Fatal(err)
++		}
++		n++
++	}
++
++	end := BeginDataPathWrite(folder)
++	if _, err := WriteTree(late); nil != err {
++		t.Fatal(err)
++	}
++	waitRaiseTestCached(t, box, late.ID)
++	if err := os.RemoveAll(folder); nil != err {
++		t.Fatal(err)
++	}
++	start := time.Now()
++	end()
++	t.Logf("the end of a remove of %d pages took %s", pages, time.Since(start))
++
++	checkRemovedPageNotServed(t, late)
++}
+diff --git a/kernel/filesys/challenge_step4_test.go b/kernel/filesys/challenge_step4_test.go
+new file mode 100644
+index 0000000..7229d34
+--- /dev/null
++++ b/kernel/filesys/challenge_step4_test.go
+@@ -0,0 +1,81 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Step 4's challenger: a remove's bracket misses a page written into the folder after the bracket began.
++//
++// A remove of a folder bracketed by BeginDataPathWrite (removeDataPath, so box.Remove of a page's sub-page folder,
++// removeBoxDir, the file API's removeFile, the MCP file tool's delete, WebDAV's RemoveAll, the notebook archive's move
++// out of data/) notes the pages the folder holds by walking it when the bracket begins, and its end raises what it
++// noted and what the folder holds afterwards, which is nothing. A page written into the folder in between, such as a
++// sub-page created, or moved in, while its parent is being deleted, is in neither walk, and nothing raises it. Its
++// page cache entry, which its own WriteTree stored with the version that write's end returned, stays current though
++// the remove took its file away: SiYuan serves the page, and a save of the page as it was (a job that holds it and
++// commits it unchanged) is skipped by WriteTree's skip lookup as already written, so the page gets no file at all.
++func TestRemovingAFolderRaisesAPageWrittenIntoItDuringTheRemove(t *testing.T) {
++	box, parent, _, _ := setupStalePathTest(t)
++	folder := filepath.Join(util.DataDir, box, parent)
++	existing := treenode.NewTree(box, "/"+parent+"/20261018020001-existng.sy", "/Parent/Existing", "Existing")
++	if _, err := WriteTree(existing); nil != err {
++		t.Fatal(err)
++	}
++
++	end := BeginDataPathWrite(folder)
++	// While the remove is under way, a page is written into the folder, and caches what it wrote.
++	late := treenode.NewTree(box, "/"+parent+"/20261018020002-latepge.sy", "/Parent/Late", "Late")
++	if _, err := WriteTree(late); nil != err {
++		t.Fatal(err)
++	}
++	for deadline := time.Now().Add(200 * time.Millisecond); ; time.Sleep(time.Millisecond) {
++		if _, ok := cache.GetTreeDataInBox(late.ID, box); ok {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("setup: the page cache doesn't serve the page written into the folder")
++		}
++	}
++	if err := os.RemoveAll(folder); nil != err {
++		t.Fatal(err)
++	}
++	end()
++
++	latePath := filepath.Join(util.DataDir, box, late.Path)
++	if _, err := os.Stat(latePath); !os.IsNotExist(err) {
++		t.Fatalf("setup: the remove left the page's file: %v", err)
++	}
++	if _, ok := cache.GetTreeDataInBox(late.ID, box); ok {
++		t.Error("after the remove, the page cache serves the page written into the folder during it, whose file the " +
++			"remove took away")
++	}
++	if _, err := WriteTree(late); nil != err {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(latePath); nil != err {
++		t.Errorf("a save of the page as it was, after the remove, wrote no file: %v", err)
++	}
++}
+diff --git a/kernel/filesys/raise.go b/kernel/filesys/raise.go
+new file mode 100644
+index 0000000..71b3f14
+--- /dev/null
++++ b/kernel/filesys/raise.go
+@@ -0,0 +1,240 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/88250/lute/ast"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// RaiseForDataPath raises, after a write that bypassed WriteTree and saveAttributeView, what the write changed at each
++// path: a page file (data/<box>/…/<id>.sy) raises its page, a database file (data/storage/av/<id>.json, or
++// data/<box>/storage/av/<id>.json in an encrypted notebook) its database, and a folder every page and database file
++// under it. A path holding data/ itself raises everything (cache.RaiseAll); a path outside data/ raises nothing.
++//
++// A folder is walked as it is after the write. That raises exactly the pages and databases it holds, and never floors
++// or the caches of anything else. A write that may take files away (a remove) brackets itself with BeginDataPathWrite
++// instead, which also walks the folder before the write; a copy into a folder that holds more than the copy raises
++// with RaiseForDataCopy, which walks only what was copied.
++func RaiseForDataPath(absPaths ...string) {
++	var targets dataPathTargets
++	for _, p := range absPaths {
++		targets.collect(p)
++	}
++	targets.raise()
++}
++
++// BeginDataPathWrite notes the pages and databases each path holds before a write that may take them away, such as a
++// remove, and returns the raise to call once the write has finished: it raises what was noted and what the paths hold
++// then, as RaiseForDataPath does.
++//
++// When a path is a folder, a page written into it while the write runs is in neither walk, and a remove takes its file
++// away. So the end also raises every page and database whose version rose since the bracket began
++// (cache.RaiseChangedSince): every write of a page raises it, so that covers the pages written into the folder, and
++// touches only what was written while the remove ran.
++func BeginDataPathWrite(absPaths ...string) (end func()) {
++	since := cache.NewFillToken()
++	var before dataPathTargets
++	folder := false
++	for _, p := range absPaths {
++		folder = before.collect(p) || folder
++	}
++	return func() {
++		for _, p := range absPaths {
++			before.collect(p)
++		}
++		before.raise()
++		if folder {
++			cache.RaiseChangedSince(since)
++		}
++	}
++}
++
++// RaiseForDataCopy raises, after a copy of src to dest that bypassed WriteTree and saveAttributeView, what the copy
++// wrote under dest: src's own file, or each file of the folder src where it lands under dest. What dest held beside the
++// copy isn't raised, so a copy into a notebook raises only the pages it brought. The copy may have failed part way; it
++// is raised all the same.
++func RaiseForDataCopy(src, dest string) {
++	var targets dataPathTargets
++	targets.collectCopy(src, dest)
++	targets.raise()
++}
++
++// dataPathTargets are the pages and databases a write changed.
++type dataPathTargets struct {
++	pages []string
++	avs   []cache.AVKey
++	all   bool
++}
++
++func (t *dataPathTargets) raise() {
++	if t.all {
++		cache.RaiseAll()
++		return
++	}
++	cache.RaisePages(t.pages...)
++	cache.RaiseAVs(t.avs...)
++}
++
++// dataPathPlace says where absPath lies: inside data/ (with its path relative to data/), at or above data/ (holding
++// it), or elsewhere.
++type dataPathPlace int
++
++const (
++	outsideData dataPathPlace = iota
++	insideData
++	holdingData
++)
++
++func placeDataPath(absPath string) (place dataPathPlace, rel string) {
++	if "" == absPath || "" == util.DataDir {
++		return
++	}
++	dataDir := filepath.Clean(util.DataDir)
++	rel, err := filepath.Rel(dataDir, filepath.Clean(absPath))
++	if nil != err {
++		return
++	}
++	if "." == rel {
++		return holdingData, ""
++	}
++	if !isParentRel(rel) {
++		return insideData, rel
++	}
++	if up, upErr := filepath.Rel(filepath.Clean(absPath), dataDir); nil == upErr && !isParentRel(up) {
++		return holdingData, ""
++	}
++	return
++}
++
++func isParentRel(rel string) bool {
++	return ".." == rel || strings.HasPrefix(rel, ".."+string(filepath.Separator))
++}
++
++// collect adds what absPath holds now: the page or database it names, or every one under it if it is a folder inside
++// data/. It reports whether it walked a folder.
++func (t *dataPathTargets) collect(absPath string) (folder bool) {
++	if t.all {
++		return
++	}
++	place, rel := placeDataPath(absPath)
++	switch place {
++	case holdingData:
++		t.all = true
++		return
++	case outsideData:
++		return
++	}
++
++	info, err := os.Lstat(absPath)
++	if nil != err || !info.IsDir() {
++		// A file, or a path the write took away: it names what it held.
++		t.collectFile(rel)
++		return
++	}
++	walkFiles(absPath, func(sub string) {
++		t.collectFile(filepath.Join(rel, sub))
++	})
++	return true
++}
++
++// collectCopy adds what a copy of src to dest wrote under dest.
++func (t *dataPathTargets) collectCopy(src, dest string) {
++	if t.all {
++		return
++	}
++	place, rel := placeDataPath(dest)
++	switch place {
++	case holdingData:
++		t.all = true
++		return
++	case outsideData:
++		return
++	}
++
++	info, err := os.Lstat(src)
++	if nil != err || !info.IsDir() {
++		t.collectFile(rel)
++		return
++	}
++	walkFiles(src, func(sub string) {
++		t.collectFile(filepath.Join(rel, sub))
++	})
++}
++
++// walkFiles calls file with the path, relative to root, of every file under the folder root. A folder it can't read is
++// skipped.
++func walkFiles(root string, file func(sub string)) {
++	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
++		if nil != walkErr {
++			if nil != d && d.IsDir() && p != root {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		if d.IsDir() {
++			return nil
++		}
++		if sub, relErr := filepath.Rel(root, p); nil == relErr {
++			file(sub)
++		}
++		return nil
++	})
++}
++
++// collectFile adds the page or database the file at rel, relative to data/, holds, if it holds one.
++func (t *dataPathTargets) collectFile(rel string) {
++	rel = filepath.ToSlash(rel)
++	name := pathBase(rel)
++	if id, ok := strings.CutSuffix(name, ".sy"); ok {
++		if ast.IsNodeIDPattern(id) {
++			t.pages = append(t.pages, id)
++		}
++		return
++	}
++	if avID, ok := strings.CutSuffix(name, ".json"); ok && ast.IsNodeIDPattern(avID) {
++		if key, ok := liveAVKey(rel, avID); ok {
++			t.avs = append(t.avs, key)
++		}
++	}
++}
++
++// liveAVKey names the database whose live file is at rel: storage/av/<id>.json, or <box>/storage/av/<id>.json in an
++// encrypted notebook. Database files anywhere else, such as copies in a page's folder, are no database's live file.
++func liveAVKey(rel, avID string) (key cache.AVKey, ok bool) {
++	parts := strings.Split(rel, "/")
++	switch {
++	case 3 == len(parts) && "storage" == parts[0] && "av" == parts[1]:
++		return cache.AVKey{AVID: avID}, true
++	case 4 == len(parts) && ast.IsNodeIDPattern(parts[0]) && "storage" == parts[1] && "av" == parts[2]:
++		return cache.AVKey{AVID: avID, BoxID: parts[0]}, true
++	}
++	return
++}
++
++func pathBase(slashPath string) string {
++	if i := strings.LastIndex(slashPath, "/"); 0 <= i {
++		return slashPath[i+1:]
++	}
++	return slashPath
++}
+diff --git a/kernel/filesys/raise_test.go b/kernel/filesys/raise_test.go
+new file mode 100644
+index 0000000..8797fe5
+--- /dev/null
++++ b/kernel/filesys/raise_test.go
+@@ -0,0 +1,232 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package filesys
++
++import (
++	"os"
++	"path/filepath"
++	"slices"
++	"testing"
++
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++const (
++	raiseBox      = "20261017130000-raisebx"
++	raiseParent   = "20261017130001-parent1"
++	raiseChild    = "20261017130002-child01"
++	raiseOutside  = "20261017130003-outside"
++	raiseAV       = "20261017130004-databas"
++	raiseBoxAV    = "20261017130005-boxdbas"
++	raiseStrayAV  = "20261017130006-strayav"
++	raiseHistory  = "20261017130007-history"
++	raiseNotAPage = "notes"
++)
++
++// setupRaiseTest makes a data folder with a notebook holding a page with a sub-page and a page beside it, a database in
++// data/storage/av, an encrypted notebook's database in its own storage/av, and files that are neither.
++func setupRaiseTest(t *testing.T) (dataDir string) {
++	t.Helper()
++	original := util.DataDir
++	workspace := t.TempDir()
++	util.DataDir = filepath.Join(workspace, "data")
++	t.Cleanup(func() { util.DataDir = original })
++	for _, p := range []string{
++		filepath.Join(raiseBox, raiseParent+".sy"),
++		filepath.Join(raiseBox, raiseParent, raiseChild+".sy"),
++		filepath.Join(raiseBox, raiseParent, raiseNotAPage+".sy"),
++		filepath.Join(raiseBox, raiseOutside+".sy"),
++		filepath.Join(raiseBox, ".siyuan", "conf.json"),
++		filepath.Join(raiseBox, "storage", "av", raiseBoxAV+".json"),
++		filepath.Join(raiseBox, raiseParent, "storage", "av", raiseStrayAV+".json"),
++		filepath.Join("storage", "av", raiseAV+".json"),
++		filepath.Join("storage", "av", "blocks.msgpack"),
++		filepath.Join("assets", "image.png"),
++		filepath.Join("..", "history", "2026-10-17-130000-update", raiseBox, raiseHistory+".sy"),
++	} {
++		abs := filepath.Join(util.DataDir, p)
++		if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(abs, []byte("{}"), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return util.DataDir
++}
++
++func collectForRaiseTest(paths ...string) (t dataPathTargets) {
++	for _, p := range paths {
++		t.collect(p)
++	}
++	slices.Sort(t.pages)
++	slices.SortFunc(t.avs, func(a, b cache.AVKey) int {
++		if a.AVID != b.AVID {
++			if a.AVID < b.AVID {
++				return -1
++			}
++			return 1
++		}
++		if a.BoxID < b.BoxID {
++			return -1
++		}
++		if a.BoxID > b.BoxID {
++			return 1
++		}
++		return 0
++	})
++	return
++}
++
++// A path names the pages and databases a write there changed: a page file its page, a live database file its database
++// in its notebook, a folder what it holds, data/ or a folder holding it everything, and anything outside data/ nothing.
++func TestDataPathsNameWhatTheyHold(t *testing.T) {
++	dataDir := setupRaiseTest(t)
++	for name, c := range map[string]struct {
++		paths []string
++		pages []string
++		avs   []cache.AVKey
++		all   bool
++	}{
++		"page file":                   {paths: []string{filepath.Join(dataDir, raiseBox, raiseOutside+".sy")}, pages: []string{raiseOutside}},
++		"page file removed":           {paths: []string{filepath.Join(dataDir, raiseBox, "20261017130009-removed.sy")}, pages: []string{"20261017130009-removed"}},
++		"page's folder":               {paths: []string{filepath.Join(dataDir, raiseBox, raiseParent)}, pages: []string{raiseChild}},
++		"page file and its folder":    {paths: []string{filepath.Join(dataDir, raiseBox, raiseParent+".sy"), filepath.Join(dataDir, raiseBox, raiseParent)}, pages: []string{raiseParent, raiseChild}},
++		"notebook":                    {paths: []string{filepath.Join(dataDir, raiseBox)}, pages: []string{raiseParent, raiseChild, raiseOutside}, avs: []cache.AVKey{{AVID: raiseBoxAV, BoxID: raiseBox}}},
++		"database":                    {paths: []string{filepath.Join(dataDir, "storage", "av", raiseAV+".json")}, avs: []cache.AVKey{{AVID: raiseAV}}},
++		"database folder":             {paths: []string{filepath.Join(dataDir, "storage")}, avs: []cache.AVKey{{AVID: raiseAV}}},
++		"encrypted notebook database": {paths: []string{filepath.Join(dataDir, raiseBox, "storage", "av", raiseBoxAV+".json")}, avs: []cache.AVKey{{AVID: raiseBoxAV, BoxID: raiseBox}}},
++		"database file elsewhere":     {paths: []string{filepath.Join(dataDir, raiseBox, raiseParent, "storage", "av", raiseStrayAV+".json")}},
++		"data":                        {paths: []string{dataDir}, all: true},
++		"data with a trailing slash":  {paths: []string{dataDir + string(filepath.Separator)}, all: true},
++		"workspace":                   {paths: []string{filepath.Dir(dataDir)}, all: true},
++		"history":                     {paths: []string{filepath.Join(filepath.Dir(dataDir), "history")}},
++		"history page":                {paths: []string{filepath.Join(filepath.Dir(dataDir), "history", "2026-10-17-130000-update", raiseBox, raiseHistory+".sy")}},
++		"assets":                      {paths: []string{filepath.Join(dataDir, "assets")}},
++		"notebook settings":           {paths: []string{filepath.Join(dataDir, raiseBox, ".siyuan", "conf.json")}},
++		"a folder beside data's name": {paths: []string{dataDir + "2"}},
++		"no path":                     {paths: []string{""}},
++	} {
++		t.Run(name, func(t *testing.T) {
++			got := collectForRaiseTest(c.paths...)
++			if got.all != c.all || !slices.Equal(got.pages, c.pages) || !slices.Equal(got.avs, c.avs) {
++				t.Fatalf("got pages %v, databases %v, all %v; want pages %v, databases %v, all %v", got.pages, got.avs, got.all, c.pages, c.avs, c.all)
++			}
++		})
++	}
++}
++
++// RaiseForDataPath raises what a folder holds after a write into it, and nothing beside it.
++func TestRaiseForDataPathRaisesWhatAFolderHolds(t *testing.T) {
++	dataDir := setupRaiseTest(t)
++	noted := cache.NewFillToken()
++	RaiseForDataPath(filepath.Join(dataDir, raiseBox, raiseParent))
++	if cache.TreeFresh(raiseChild, noted) {
++		t.Fatal("a page in the folder written was not raised")
++	}
++	if !cache.TreeFresh(raiseOutside, noted) || !cache.TreeFresh(raiseParent, noted) {
++		t.Fatal("a page beside the folder written was raised")
++	}
++}
++
++// A remove bracketed by BeginDataPathWrite raises what the folder held before it took it away.
++func TestBeginDataPathWriteRaisesWhatARemoveTookAway(t *testing.T) {
++	dataDir := setupRaiseTest(t)
++	notebook := filepath.Join(dataDir, raiseBox)
++	t.Cleanup(cache.ClearAVCache)
++	avVersion := cache.EnsureAVDataVersionInBox(raiseBoxAV, raiseBox)
++	noted := cache.NewFillToken()
++
++	end := BeginDataPathWrite(notebook)
++	if err := os.RemoveAll(notebook); err != nil {
++		t.Fatal(err)
++	}
++	for _, id := range []string{raiseParent, raiseChild, raiseOutside} {
++		if !cache.TreeFresh(id, noted) {
++			t.Fatalf("page %s was raised before the write ended", id)
++		}
++	}
++	end()
++
++	for _, id := range []string{raiseParent, raiseChild, raiseOutside} {
++		if cache.TreeFresh(id, noted) {
++			t.Fatalf("page %s, which the remove took away, was not raised", id)
++		}
++	}
++	if cache.EnsureAVDataVersionInBox(raiseBoxAV, raiseBox) == avVersion {
++		t.Fatal("the notebook's database, which the remove took away, was not raised")
++	}
++}
++
++// A copy names what it wrote where it landed, and not what its destination held beside it; a copy into data/ itself
++// names everything.
++func TestDataCopiesNameWhatTheyWrote(t *testing.T) {
++	dataDir := setupRaiseTest(t)
++	const copied, copiedChild, copiedAV = "20261017130010-copied1", "20261017130011-copied2", "20261017130012-copieda"
++	src := filepath.Join(t.TempDir(), "import")
++	for _, p := range []string{
++		filepath.Join(copied + ".sy"),
++		filepath.Join(copied, copiedChild+".sy"),
++		filepath.Join("storage", "av", copiedAV+".json"),
++	} {
++		abs := filepath.Join(src, p)
++		if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(abs, []byte("{}"), 0644); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	var into dataPathTargets
++	into.collectCopy(src, filepath.Join(dataDir, raiseBox))
++	slices.Sort(into.pages)
++	if want := []string{copied, copiedChild}; into.all || !slices.Equal(into.pages, want) {
++		t.Fatalf("a copy into a notebook named pages %v, all %v; want %v", into.pages, into.all, want)
++	}
++	if want := []cache.AVKey{{AVID: copiedAV, BoxID: raiseBox}}; !slices.Equal(into.avs, want) {
++		t.Fatalf("a copy into a notebook named databases %v; want %v", into.avs, want)
++	}
++
++	var file dataPathTargets
++	file.collectCopy(filepath.Join(src, copied+".sy"), filepath.Join(dataDir, raiseBox, copied+".sy"))
++	if want := []string{copied}; !slices.Equal(file.pages, want) {
++		t.Fatalf("a copied page file named pages %v; want %v", file.pages, want)
++	}
++
++	var whole dataPathTargets
++	whole.collectCopy(src, dataDir)
++	if !whole.all {
++		t.Fatal("a copy into data/ didn't name everything")
++	}
++
++	var elsewhere dataPathTargets
++	elsewhere.collectCopy(filepath.Join(dataDir, raiseBox), filepath.Join(filepath.Dir(dataDir), "history", "copy"))
++	if elsewhere.all || 0 < len(elsewhere.pages) || 0 < len(elsewhere.avs) {
++		t.Fatalf("a copy out of data/ named pages %v, databases %v, all %v", elsewhere.pages, elsewhere.avs, elsewhere.all)
++	}
++
++	noted := cache.NewFillToken()
++	RaiseForDataCopy(src, filepath.Join(dataDir, raiseBox))
++	if cache.TreeFresh(copied, noted) || cache.TreeFresh(copiedChild, noted) {
++		t.Fatal("a copied page was not raised")
++	}
++	if !cache.TreeFresh(raiseOutside, noted) || !cache.TreeFresh(raiseParent, noted) {
++		t.Fatal("a page the destination held beside the copy was raised")
++	}
++}
+diff --git a/kernel/harmony/kernel.go b/kernel/harmony/kernel.go
+index 9de96b9..304bfc9 100644
+--- a/kernel/harmony/kernel.go
++++ b/kernel/harmony/kernel.go
+@@ -31,6 +31,7 @@ import (
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/job"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/plugin"
+@@ -242,7 +243,11 @@ func HTML2Markdown(html *C.char) *C.char {
+ //export Unzip
+ func Unzip(zipFilePath, destination *C.char) {
+ 	var zipPath string = C.GoString(zipFilePath)
+-	if err := gulu.Zip.Unzip(zipPath, C.GoString(destination)); nil != err {
++	dest := C.GoString(destination)
++	err := gulu.Zip.Unzip(zipPath, dest)
++	// The native shell may unzip anywhere: raise the pages and databases the archive wrote, if any.
++	filesys.RaiseForDataPath(dest)
++	if nil != err {
+ 		logging.LogErrorf("unzip [%s] failed: %s", zipPath, err)
+ 		panic(err)
+ 	}
+diff --git a/kernel/mcp/tools/challenge_step4_round1_test.go b/kernel/mcp/tools/challenge_step4_round1_test.go
+new file mode 100644
+index 0000000..ab06b46
+--- /dev/null
++++ b/kernel/mcp/tools/challenge_step4_round1_test.go
+@@ -0,0 +1,41 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package tools
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Step 4's challenger, fix round 1: the MCP file tool's copy now raises a walk of its destination, which follows no
++// link. copyPath writes through a link at the destination (os.MkdirAll accepts a link to a folder, os.Create follows a
++// link to a file), so a copy into a destination that is a link to a notebook's folder writes the notebook's pages, and
++// the walk, which sees the link as a file whose name is no page, raises none of them. Links inside the workspace are
++// allowed. (The file API's copies refuse a destination that is a link.)
++func TestFileToolCopyIntoALinkServesTheCopy(t *testing.T) {
++	f := setupToolWriterTest(t)
++	stageToolFile(t, "stage/"+toolBoxID+"/"+toolPageID+".sy", f.newPage)
++	alias := filepath.Join(util.DataDir, "alias")
++	if err := os.Symlink(filepath.Join(util.DataDir, toolBoxID), alias); nil != err {
++		t.Skipf("symbolic links unavailable: %v", err)
++	}
++	callFileTool(t, map[string]any{"action": "copy", "src": "stage/" + toolBoxID, "dst": "data/alias"})
++	checkToolPage(t, "after the tool's copy into a link to the notebook's folder", "new")
++}
+diff --git a/kernel/mcp/tools/challenge_step4_test.go b/kernel/mcp/tools/challenge_step4_test.go
+new file mode 100644
+index 0000000..c08d224
+--- /dev/null
++++ b/kernel/mcp/tools/challenge_step4_test.go
+@@ -0,0 +1,47 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package tools
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Step 4's challenger: the MCP file tool's copy follows symbolic links to folders, and its raise doesn't.
++//
++// The tool's copyPath stats each path it copies with os.Stat, so a link to a folder, as the copy's source or anywhere
++// inside it, is copied as the folder it points to, pages and all. RaiseForDataCopy walks the source with os.Lstat and
++// filepath.WalkDir, which follow no link: it sees each link as a file whose name is no page, and raises nothing for
++// what the copy wrote through it. Links inside the workspace are allowed (authorizePath refuses only those that leave
++// it). The test copies, over the notebook, a link to a notebook folder holding the page's new copy; a link to a
++// page's sub-page folder inside a copied folder is missed the same way.
++func TestFileToolCopyThroughALinkServesTheCopy(t *testing.T) {
++	f := setupToolWriterTest(t)
++	stageToolFile(t, "stage/real/"+toolBoxID+"/"+toolPageID+".sy", f.newPage)
++	link := filepath.Join(util.WorkspaceDir, "stage", "links", toolBoxID)
++	if err := os.MkdirAll(filepath.Dir(link), 0755); nil != err {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(filepath.Join(util.WorkspaceDir, "stage", "real", toolBoxID), link); nil != err {
++		t.Skipf("symbolic links unavailable: %v", err)
++	}
++	callFileTool(t, map[string]any{"action": "copy", "src": "stage/links/" + toolBoxID, "dst": "data/" + toolBoxID})
++	checkToolPage(t, "after the tool's copy of a link to the notebook's folder", "new")
++}
+diff --git a/kernel/mcp/tools/file.go b/kernel/mcp/tools/file.go
+index 24b2bea..1ef884a 100644
+--- a/kernel/mcp/tools/file.go
++++ b/kernel/mcp/tools/file.go
+@@ -30,6 +30,7 @@ import (
+ 	"strings"
+ 	"unicode/utf8"
+ 
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ 
+@@ -371,7 +372,10 @@ func fileWrite(args map[string]any) (CallToolResult, error) {
+ 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "mkdir failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+-	if err := os.WriteFile(abs, []byte(dataStr), 0644); err != nil {
++	err = os.WriteFile(abs, []byte(dataStr), 0644)
++	// The write bypasses WriteTree and saveAttributeView: raise the page or database it wrote.
++	filesys.RaiseForDataPath(abs)
++	if err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "write file failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+ 	return CallToolResult{Content: []ContentItem{{Type: "text", Text: "file written: " + p}}}, nil
+@@ -668,6 +672,7 @@ func fileMutate(ctx context.Context, args map[string]any) (CallToolResult, error
+ 		return nil
+ 	}
+ 	result, err := util.MutateTextFile(ctx, root, p, request)
++	filesys.RaiseForDataPath(abs)
+ 	if err != nil {
+ 		return fileSafeError(err)
+ 	}
+@@ -806,11 +811,13 @@ func fileDelete(args map[string]any) (CallToolResult, error) {
+ 	if err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "stat failed: " + err.Error()}}, IsError: true}, nil
+ 	}
++	endWrite := filesys.BeginDataPathWrite(abs)
+ 	if info.IsDir() {
+ 		err = os.RemoveAll(abs)
+ 	} else {
+ 		err = os.Remove(abs)
+ 	}
++	endWrite()
+ 	if err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "delete failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+@@ -841,7 +848,9 @@ func fileRename(args map[string]any) (CallToolResult, error) {
+ 	if err := os.MkdirAll(filepath.Dir(newAbs), 0755); err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "mkdir failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+-	if err := os.Rename(oldAbs, newAbs); err != nil {
++	err = os.Rename(oldAbs, newAbs)
++	filesys.RaiseForDataPath(oldAbs, newAbs)
++	if err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "rename failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+ 	return CallToolResult{Content: []ContentItem{{Type: "text", Text: fmt.Sprintf("renamed: %s -> %s", old, newP)}}}, nil
+@@ -865,7 +874,14 @@ func fileCopy(args map[string]any) (CallToolResult, error) {
+ 	if err = authorizeCopyTree(srcAbs, dstAbs); err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: err.Error()}}, IsError: true}, nil
+ 	}
+-	if err := copyPath(srcAbs, dstAbs); err != nil {
++	err = copyPath(srcAbs, dstAbs)
++	// copyPath follows links on both sides, and neither walk does. The source's walk names what was copied by name,
++	// which holds when the destination is, or holds, a link; the destination's walk finds, as plain files, what was
++	// copied through a link in the source. Raising both covers either; the destination's walk also raises what dst
++	// held beside the copy, which costs only hits.
++	filesys.RaiseForDataCopy(srcAbs, dstAbs)
++	filesys.RaiseForDataPath(dstAbs)
++	if err != nil {
+ 		return CallToolResult{Content: []ContentItem{{Type: "text", Text: "copy failed: " + err.Error()}}, IsError: true}, nil
+ 	}
+ 	return CallToolResult{Content: []ContentItem{{Type: "text", Text: fmt.Sprintf("copied: %s -> %s", src, dst)}}}, nil
+diff --git a/kernel/mcp/tools/outside_writers_test.go b/kernel/mcp/tools/outside_writers_test.go
+new file mode 100644
+index 0000000..4794759
+--- /dev/null
++++ b/kernel/mcp/tools/outside_writers_test.go
+@@ -0,0 +1,294 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package tools
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/model"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// The MCP file tool writes workspace files with os.WriteFile, util.MutateTextFile, os.Rename, its own copy and
++// os.Remove, outside WriteTree and saveAttributeView, so nothing raises the version of the page or database it writes.
++// A page or database SiYuan read before keeps its cache entries current, and SiYuan serves them, older than the file:
++// getBlockAttrs and a page load give the page as it was, and every read of the database gives it as it was. Each test
++// below caches a page and a database through SiYuan's own reads, writes one of them with one of the tool's actions, and
++// reads it back through what SiYuan serves.
++
++const (
++	toolBoxID  = "20261017211000-toolbox"
++	toolPageID = "20261017211001-toolpag"
++	toolAVID   = "20261017211002-tooldbs"
++)
++
++// toolWriterFixture is a workspace with one notebook, holding one page whose root has custom-v=old, and one database
++// named Old table. Both have been read through SiYuan's own reads after a restart, so the page cache, the block
++// attribute cache and the database cache hold them.
++type toolWriterFixture struct {
++	pagePath    string // the page's file, relative to the workspace
++	avPath      string // the database's file, relative to the workspace
++	newPage     []byte // the page's file with custom-v=new
++	newDatabase []byte // the database's file named New table
++}
++
++func setupToolWriterTest(t *testing.T) *toolWriterFixture {
++	t.Helper()
++	previousConf := model.Conf
++	previousWorkspace, previousData, previousTemp := util.WorkspaceDir, util.DataDir, util.TempDir
++	previousHistory, previousConfDir, previousBlockTree := util.HistoryDir, util.ConfDir, util.BlockTreeDBPath
++	workspace := t.TempDir()
++	util.WorkspaceDir = workspace
++	util.DataDir = filepath.Join(workspace, "data")
++	util.TempDir = filepath.Join(workspace, "temp")
++	util.HistoryDir = filepath.Join(workspace, "history")
++	util.ConfDir = filepath.Join(workspace, "conf")
++	util.BlockTreeDBPath = filepath.Join(util.TempDir, "blocktree.db")
++	for _, dir := range []string{util.TempDir, util.ConfDir} {
++		if err := os.MkdirAll(dir, 0755); nil != err {
++			t.Fatal(err)
++		}
++	}
++	model.Conf = model.NewAppConf()
++	model.Conf.FileTree.Store(conf.NewFileTree())
++	model.Conf.Sync.Store(conf.NewSync())
++	model.Conf.NotebookCrypto = conf.NewNotebookCrypto()
++	treenode.InitBlockTree(true)
++	clearCaches := func() {
++		cache.ClearTreeCache()
++		cache.ClearBlocksIAL()
++		cache.ClearDocsIAL()
++		cache.RemoveAVData(toolAVID)
++	}
++	t.Cleanup(func() {
++		clearCaches()
++		treenode.CloseDatabase()
++		model.Conf = previousConf
++		util.WorkspaceDir, util.DataDir, util.TempDir = previousWorkspace, previousData, previousTemp
++		util.HistoryDir, util.ConfDir, util.BlockTreeDBPath = previousHistory, previousConfDir, previousBlockTree
++	})
++
++	box := &model.Box{ID: toolBoxID}
++	boxConf := conf.NewBoxConf()
++	boxConf.Name = "Work"
++	boxConf.Closed = false
++	if err := box.SaveConf(boxConf); nil != err {
++		t.Fatalf("setup: save the notebook's conf failed: %v", err)
++	}
++	tree := treenode.NewTree(toolBoxID, "/"+toolPageID+".sy", "/Page", "Page")
++	tree.Root.SetIALAttr("custom-v", "old")
++	if _, err := filesys.WriteTree(tree); nil != err {
++		t.Fatalf("setup: write the page failed: %v", err)
++	}
++	treenode.UpsertBlockTree(tree)
++	attrView := &av.AttributeView{ID: toolAVID, Spec: av.RichTextSpec, Name: "Old table",
++		KeyValues: []*av.KeyValues{{Key: &av.Key{ID: "20261017211003-blockky", Name: "Name", Type: av.KeyTypeBlock}}},
++		Views: []*av.View{{ID: "20261017211004-tablevw", Name: "Table", LayoutType: av.LayoutTypeTable,
++			Table: av.NewLayoutTable(), PageSize: av.ViewDefaultPageSize}},
++		RenderedViewables: map[string]av.Viewable{}}
++	if err := av.SaveAttributeView(attrView); nil != err {
++		t.Fatalf("setup: save the database failed: %v", err)
++	}
++
++	f := &toolWriterFixture{
++		pagePath: "data/" + toolBoxID + "/" + toolPageID + ".sy",
++		avPath:   "data/storage/av/" + toolAVID + ".json",
++	}
++	f.newPage = replaceToolJSONString(t, readToolFile(t, f.pagePath), "custom-v", "old", "new")
++	f.newDatabase = replaceToolJSONString(t, readToolFile(t, f.avPath), "name", "Old table", "New table")
++
++	// As after a restart, then SiYuan's own reads: getBlockAttrs loads the page, which fills the page cache and the
++	// block attribute cache, and a read of the database fills the database cache. One read each: a second fill of a
++	// key ristretto hasn't taken in yet is turned away, and the page cache then serves neither copy.
++	clearCaches()
++	if got := sql.GetBlockAttrs(toolPageID)["custom-v"]; "old" != got {
++		t.Fatalf("setup: getBlockAttrs gives the page custom-v=%q", got)
++	}
++	if attrView, err := av.ParseAttributeView(toolAVID); nil != err || "Old table" != attrView.Name {
++		t.Fatalf("setup: the database reads %v, %v", attrView, err)
++	}
++	waitToolCached(t, "the page cache doesn't serve the page", func() bool {
++		_, ok := cache.GetTreeDataInBox(toolPageID, toolBoxID)
++		return ok
++	})
++	waitToolCached(t, "the block attribute cache doesn't serve the page's attributes", func() bool {
++		return nil != cache.GetBlockIALInBox(toolPageID, toolBoxID)
++	})
++	waitToolCached(t, "the database cache doesn't serve the database", func() bool {
++		_, ok := cache.GetAVData(toolAVID)
++		return ok
++	})
++	return f
++}
++
++// waitToolCached waits up to 200 ms for the cache to take in what a read stored: ristretto takes a store in on a
++// goroutine of its own, and a read straight after it would miss and read the file, which would hide the fault.
++func waitToolCached(t *testing.T, what string, cached func() bool) {
++	t.Helper()
++	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
++		if cached() {
++			return
++		}
++	}
++	t.Fatalf("setup: %s", what)
++}
++
++func readToolFile(t *testing.T, workspacePath string) []byte {
++	t.Helper()
++	data, err := os.ReadFile(filepath.Join(util.WorkspaceDir, filepath.FromSlash(workspacePath)))
++	if nil != err {
++		t.Fatalf("read %s failed: %v", workspacePath, err)
++	}
++	return data
++}
++
++// toolJSONString is "name":"value" as SiYuan writes it in workspacePath's file, on one line or indented.
++func toolJSONString(data []byte, name, value string) []byte {
++	for _, separator := range []string{":", ": "} {
++		if s := []byte(`"` + name + `"` + separator + `"` + value + `"`); bytes.Contains(data, s) {
++			return s
++		}
++	}
++	return nil
++}
++
++// replaceToolJSONString replaces "name":"old" with "name":"new" in a file SiYuan wrote.
++func replaceToolJSONString(t *testing.T, data []byte, name, old, new string) []byte {
++	t.Helper()
++	from := toolJSONString(data, name, old)
++	if nil == from {
++		t.Fatalf("setup: the file holds no %q: %q", name, old)
++	}
++	return bytes.Replace(data, from, bytes.Replace(from, []byte(`"`+old+`"`), []byte(`"`+new+`"`), 1), 1)
++}
++
++// requireToolFileHolds stops the test unless the file at workspacePath holds "name":"value": an action under test
++// that wrote nothing would make every read look stale.
++func requireToolFileHolds(t *testing.T, step, workspacePath, name, value string) {
++	t.Helper()
++	if nil == toolJSONString(readToolFile(t, workspacePath), name, value) {
++		t.Fatalf("%s: %s doesn't hold %s=%q", step, workspacePath, name, value)
++	}
++}
++
++// checkToolPage reads the page as SiYuan serves it, through getBlockAttrs and a page load, and wants custom-v=want,
++// which its file holds.
++func checkToolPage(t *testing.T, step, want string) {
++	t.Helper()
++	requireToolFileHolds(t, step, "data/"+toolBoxID+"/"+toolPageID+".sy", "custom-v", want)
++	if got := sql.GetBlockAttrs(toolPageID)["custom-v"]; want != got {
++		t.Errorf("%s: getBlockAttrs gives the page custom-v=%q, though its file holds %q", step, got, want)
++	}
++	tree, err := filesys.LoadTree(toolBoxID, "/"+toolPageID+".sy", util.NewLute())
++	if nil != err {
++		t.Errorf("%s: load the page failed: %v", step, err)
++		return
++	}
++	if got := tree.Root.IALAttr("custom-v"); want != got {
++		t.Errorf("%s: the page loads with custom-v=%q, though its file holds %q", step, got, want)
++	}
++}
++
++// checkToolDatabase reads the database as every operation on it starts, and wants its name to be want, which its file
++// holds.
++func checkToolDatabase(t *testing.T, step, want string) {
++	t.Helper()
++	requireToolFileHolds(t, step, "data/storage/av/"+toolAVID+".json", "name", want)
++	attrView, err := av.ParseAttributeView(toolAVID)
++	if nil != err || nil == attrView {
++		t.Errorf("%s: read the database failed: %v", step, err)
++		return
++	}
++	if want != attrView.Name {
++		t.Errorf("%s: the database reads with the name %q, though its file holds %q", step, attrView.Name, want)
++	}
++}
++
++// callFileTool runs one action of the MCP file tool and wants it to succeed.
++func callFileTool(t *testing.T, args map[string]any) {
++	t.Helper()
++	result, err := fileHandler(args)
++	if nil != err || result.IsError {
++		t.Fatalf("file tool %v failed: %s, %v", args["action"], probeText(result), err)
++	}
++}
++
++// stageToolFile writes data at a workspace path outside data/, where nothing caches, for the tool to copy or rename
++// from.
++func stageToolFile(t *testing.T, workspacePath string, data []byte) {
++	t.Helper()
++	writeProbeFile(t, filepath.Join(util.WorkspaceDir, filepath.FromSlash(workspacePath)), string(data))
++}
++
++// Each of the MCP file tool's actions that write, on a page's file or a database's file: write and copy over the
++// database (a plain write with os.WriteFile, a copy with the tool's own copyFile), write and edit of the page (edit
++// through util.MutateTextFile, which the tool also uses for conditional writes), rename of a new copy over the page
++// (os.Rename replaces it), and delete of the page, after which getBlockAttrs must give the page no attributes, since
++// its file holds nothing. On v3.8.7 and step 3 none of them raises anything.
++func TestFileToolWritesServeWhatTheToolWrote(t *testing.T) {
++	t.Run("write a page", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		callFileTool(t, map[string]any{"action": "write", "path": f.pagePath, "data": string(f.newPage)})
++		checkToolPage(t, "after the tool's write", "new")
++	})
++	t.Run("write a database", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		callFileTool(t, map[string]any{"action": "write", "path": f.avPath, "data": string(f.newDatabase)})
++		checkToolDatabase(t, "after the tool's write", "New table")
++	})
++	t.Run("edit a page", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		page := readFilePage(t, map[string]any{"path": f.pagePath, "lineLimit": -1})
++		oldText := string(toolJSONString(readToolFile(t, f.pagePath), "custom-v", "old"))
++		newText := string(toolJSONString(f.newPage, "custom-v", "new"))
++		callFileTool(t, map[string]any{"action": "edit", "path": f.pagePath, "expectedRevision": page.Revision,
++			"edits": []any{map[string]any{"oldText": oldText, "newText": newText}}})
++		checkToolPage(t, "after the tool's edit", "new")
++	})
++	t.Run("copy over a database", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		stageToolFile(t, "stage/"+toolAVID+".json", f.newDatabase)
++		callFileTool(t, map[string]any{"action": "copy", "src": "stage/" + toolAVID + ".json", "dst": f.avPath})
++		checkToolDatabase(t, "after the tool's copy", "New table")
++	})
++	t.Run("rename over a page", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		stageToolFile(t, "stage/"+toolPageID+".sy", f.newPage)
++		callFileTool(t, map[string]any{"action": "rename", "old": "stage/" + toolPageID + ".sy", "new": f.pagePath})
++		checkToolPage(t, "after the tool's rename", "new")
++	})
++	t.Run("delete a page", func(t *testing.T) {
++		f := setupToolWriterTest(t)
++		callFileTool(t, map[string]any{"action": "delete", "path": f.pagePath})
++		if _, err := os.Stat(filepath.Join(util.WorkspaceDir, filepath.FromSlash(f.pagePath))); !os.IsNotExist(err) {
++			t.Fatalf("setup: the tool's delete left the page's file: %v", err)
++		}
++		if got := sql.GetBlockAttrs(toolPageID); 0 < len(got) {
++			t.Errorf("after the tool's delete, getBlockAttrs gives the page the attributes %v, though its file is gone", got)
++		}
++	})
++}
+diff --git a/kernel/mcp/tools/unzip.go b/kernel/mcp/tools/unzip.go
+index fde09f6..d613821 100644
+--- a/kernel/mcp/tools/unzip.go
++++ b/kernel/mcp/tools/unzip.go
+@@ -25,6 +25,7 @@ import (
+ 	"strings"
+ 	"unicode/utf8"
+ 
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ 
+ 	"github.com/88250/gulu"
+@@ -132,7 +133,12 @@ func extractGuardedArchive(zipAbs, destAbs string) error {
+ 		if err = authorizeArchiveEntry(destAbs, members[i].path, members[i].name); err != nil {
+ 			return err
+ 		}
+-		if err = extractArchiveEntry(entry, members[i].path); err != nil {
++		err = extractArchiveEntry(entry, members[i].path)
++		if !entry.FileInfo().IsDir() {
++			// The entry bypasses WriteTree and saveAttributeView: raise the page or database it wrote.
++			filesys.RaiseForDataPath(members[i].path)
++		}
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/kernel/mobile/kernel.go b/kernel/mobile/kernel.go
+index 99ebfc9..37b872f 100644
+--- a/kernel/mobile/kernel.go
++++ b/kernel/mobile/kernel.go
+@@ -33,6 +33,7 @@ import (
+ 	"github.com/siyuan-note/httpclient"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/job"
+ 	"github.com/siyuan-note/siyuan/kernel/model"
+ 	"github.com/siyuan-note/siyuan/kernel/plugin"
+@@ -392,7 +393,10 @@ func HTML2Markdown(html string) string {
+ }
+ 
+ func Unzip(zipFilePath, destination string) {
+-	if err := gulu.Zip.Unzip(zipFilePath, destination); nil != err {
++	err := gulu.Zip.Unzip(zipFilePath, destination)
++	// The native shell may unzip anywhere: raise the pages and databases the archive wrote, if any.
++	filesys.RaiseForDataPath(destination)
++	if nil != err {
+ 		logging.LogErrorf("unzip [%s] failed: %s", zipFilePath, err)
+ 		panic(err)
+ 	}
+diff --git a/kernel/model/asset_download.go b/kernel/model/asset_download.go
+index e8b03da..bd78509 100644
+--- a/kernel/model/asset_download.go
++++ b/kernel/model/asset_download.go
+@@ -163,7 +163,7 @@ func EnsureAssetLocal(absPath string) error {
+ 			}
+ 			var downloaded bool
+ 			handleCloudError := cloudRepoErrorHandler()
+-			if downloaded, err = repo.EnsureAsset(rel, newSyncContext()); err != nil {
++			if downloaded, err = repo.EnsureAsset(rel, newAssetSyncContext()); err != nil {
+ 				handleCloudError(err)
+ 				return fmt.Errorf("%s: %w", Conf.Language(376), err)
+ 			}
+@@ -220,7 +220,7 @@ func EnsureAssetPrefixLocal(absPrefix string) error {
+ 		}
+ 		var downloaded bool
+ 		handleCloudError := cloudRepoErrorHandler()
+-		if downloaded, err = repo.EnsureAsset(file.Path, newSyncContext()); err != nil {
++		if downloaded, err = repo.EnsureAsset(file.Path, newAssetSyncContext()); err != nil {
+ 			handleCloudError(err)
+ 			return fmt.Errorf("%s: %w", Conf.Language(376), err)
+ 		}
+@@ -256,7 +256,7 @@ func ensureAllSyncAssets() error {
+ 		return err
+ 	}
+ 	handleCloudError := cloudRepoErrorHandler()
+-	if err = repo.EnsureAllAssets(newSyncContext()); err != nil {
++	if err = repo.EnsureAllAssets(newAssetSyncContext()); err != nil {
+ 		handleCloudError(err)
+ 		return fmt.Errorf("%s: %w", Conf.Language(376), err)
+ 	}
+diff --git a/kernel/model/asset_download_recovery.go b/kernel/model/asset_download_recovery.go
+index 2c3e505..15328f9 100644
+--- a/kernel/model/asset_download_recovery.go
++++ b/kernel/model/asset_download_recovery.go
+@@ -18,6 +18,8 @@ func processAssetDownloadRecovery(repo *dejavu.Repo, recoverFiles bool) error {
+ 	var err error
+ 	if recoverFiles {
+ 		id, changes, err = repo.RecoverAssetDownloads(newSyncContext())
++		// The recovery applies a sync's pending changes to the data folder, as the sync itself would have.
++		raiseAfterSync(changes, err)
+ 	} else {
+ 		id, changes, err = repo.AssetDownloadChanges()
+ 	}
+diff --git a/kernel/model/assets.go b/kernel/model/assets.go
+index 044b519..6b1eba8 100644
+--- a/kernel/model/assets.go
++++ b/kernel/model/assets.go
+@@ -1872,7 +1872,9 @@ func RenameAsset(oldPath, newName string) (newPath string, err error) {
+ 				}
+ 
+ 				data = []byte(nameReplacer.Replace(string(data)))
+-				if writeErr := filelock.WriteFile(treeAbsPath, data); nil != writeErr {
++				writeErr := filelock.WriteFile(treeAbsPath, data)
++				filesys.RaiseForDataPath(treeAbsPath)
++				if nil != writeErr {
+ 					logging.LogErrorf("write data [path=%s] failed: %s", treeAbsPath, writeErr)
+ 					err = writeErr
+ 					return
+@@ -1956,7 +1958,9 @@ func replaceAttributeViewAssetPath(avJSONPath, avID, oldPath, newPath string) (u
+ 		return
+ 	}
+ 	data = replacedData
+-	if err = filelock.WriteFile(avJSONPath, data); nil != err {
++	err = filelock.WriteFile(avJSONPath, data)
++	filesys.RaiseForDataPath(avJSONPath)
++	if nil != err {
+ 		return
+ 	}
+ 	cache.RemoveAVData(avID)
+diff --git a/kernel/model/attribute_view.go b/kernel/model/attribute_view.go
+index da38840..a7387df 100644
+--- a/kernel/model/attribute_view.go
++++ b/kernel/model/attribute_view.go
+@@ -94,7 +94,10 @@ func RemoveUnusedAttributeView(id string) (err error) {
+ 		}
+ 	}
+ 
+-	if err = filelock.RemoveWithoutFatal(absPath); err != nil {
++	endWrite := filesys.BeginDataPathWrite(absPath)
++	err = filelock.RemoveWithoutFatal(absPath)
++	endWrite()
++	if err != nil {
+ 		logging.LogErrorf("remove unused asset [%s] failed: %s", absPath, err)
+ 		util.PushErrMsg(fmt.Sprintf("%s", err), 7000)
+ 		return
+@@ -151,7 +154,10 @@ func RemoveUnusedAttributeViews() (ret []string, err error) {
+ 				size += info.Size()
+ 			}
+ 
+-			if removeErr := filelock.RemoveWithoutFatal(absPath); removeErr != nil {
++			endWrite := filesys.BeginDataPathWrite(absPath)
++			removeErr := filelock.RemoveWithoutFatal(absPath)
++			endWrite()
++			if removeErr != nil {
+ 				err = removeErr
+ 				logging.LogErrorf("remove unused av [%s] failed: %s", absPath, removeErr)
+ 				util.PushErrMsg(fmt.Sprintf("%s", removeErr), 7000)
+@@ -2515,7 +2521,9 @@ func DuplicateDatabaseBlock(avID string) (newAvID, newBlockID string, err error)
+ 		}
+ 		av.SetAVBoxID(newAvID, avBoxID)
+ 	}
+-	if err = filelock.WriteFile(newAvPath, data); err != nil {
++	err = filelock.WriteFile(newAvPath, data)
++	filesys.RaiseForDataPath(newAvPath)
++	if err != nil {
+ 		logging.LogErrorf("write attribute view [%s] failed: %s", newAvID, err)
+ 		return
+ 	}
+diff --git a/kernel/model/attribute_view_create.go b/kernel/model/attribute_view_create.go
+index 044988e..908b91f 100644
+--- a/kernel/model/attribute_view_create.go
++++ b/kernel/model/attribute_view_create.go
+@@ -26,6 +26,7 @@ import (
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/siyuan/kernel/av"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+@@ -238,7 +239,9 @@ func cleanupCreatedAttributeView(blockID, avID string) (err error) {
+ 	}
+ 	avJSONPath, boxID := av.FindAttributeViewPath(avID)
+ 	if "" != avJSONPath && filelock.IsExist(avJSONPath) {
++		endWrite := filesys.BeginDataPathWrite(avJSONPath)
+ 		err = errors.Join(err, filelock.RemoveWithoutFatal(avJSONPath))
++		endWrite()
+ 	}
+ 	cache.RemoveAVDataInBox(avID, boxID)
+ 	return
+diff --git a/kernel/model/attribute_view_transaction.go b/kernel/model/attribute_view_transaction.go
+index 3e97df1..84f513f 100644
+--- a/kernel/model/attribute_view_transaction.go
++++ b/kernel/model/attribute_view_transaction.go
+@@ -21,7 +21,6 @@ import (
+ 	"strings"
+ 
+ 	"github.com/88250/lute/parse"
+-	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/av"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
+@@ -156,7 +155,8 @@ func (tx *Transaction) finishAttributeViewMutation(rollback bool) {
+ 		for key, filename := range state.createdViews {
+ 			boxID, id, _ := strings.Cut(key, "/")
+ 			view, _ := av.ParseAttributeViewForIndexInBox(id, boxID)
+-			if err := filelock.Remove(filename); err != nil {
++			err := removeDataPath(filename)
++			if err != nil {
+ 				logging.LogErrorf("remove restored database [%s] after transaction failure: %s", id, err)
+ 			} else {
+ 				cache.RemoveAVDataInBox(id, boxID)
+diff --git a/kernel/model/box.go b/kernel/model/box.go
+index 7dc7823..fa77c17 100644
+--- a/kernel/model/box.go
++++ b/kernel/model/box.go
+@@ -536,7 +536,10 @@ func (box *Box) Move(oldPath, newPath string) error {
+ 	fromPath := filepath.Join(boxLocalPath, oldPath)
+ 	toPath := filepath.Join(boxLocalPath, newPath)
+ 
+-	if err := filelock.Rename(fromPath, toPath); err != nil {
++	err := filelock.Rename(fromPath, toPath)
++	// The rename bypasses WriteTree: raise what it moved, under both paths, whether or not it succeeded.
++	filesys.RaiseForDataPath(fromPath, toPath)
++	if err != nil {
+ 		msg := fmt.Sprintf(Conf.Language(5), box.Name, fromPath, err)
+ 		logging.LogErrorf("move [path=%s] in box [%s] failed: %s", fromPath, box.Name, err)
+ 		return errors.New(msg)
+@@ -558,7 +561,7 @@ func (box *Box) Remove(path string) error {
+ 	}
+ 	boxLocalPath := filepath.Join(util.DataDir, box.ID)
+ 	filePath := filepath.Join(boxLocalPath, path)
+-	if err := filelock.Remove(filePath); err != nil {
++	if err := removeDataPath(filePath); err != nil {
+ 		msg := fmt.Sprintf(Conf.Language(7), box.Name, path, err)
+ 		logging.LogErrorf("remove [path=%s] in box [%s] failed: %s", path, box.ID, err)
+ 		return errors.New(msg)
+@@ -567,6 +570,14 @@ func (box *Box) Remove(path string) error {
+ 	return nil
+ }
+ 
++// removeDataPath removes p, a file or a folder, and raises the pages and databases it took away, as every remove that
++// bypasses WriteTree and saveAttributeView must.
++func removeDataPath(p string) error {
++	endWrite := filesys.BeginDataPathWrite(p)
++	defer endWrite()
++	return filelock.Remove(p)
++}
++
+ func (box *Box) ListFiles(path string) (ret []*FileInfo) {
+ 	// ListFiles 委托给 Ls，后者已有 validateBoxPath
+ 	fis, _, err := box.Ls(path)
+@@ -985,12 +996,19 @@ func VacuumDataIndex() {
+ 	util.PushMsg(msg, 7000)
+ }
+ 
++// testHookFullReindexRefreshed, when set by a test, is called once the goroutine FullReindex starts has flushed SQL's
++// queue and reset the virtual reference cache, so the test can wait for it before setting the workspace back.
++var testHookFullReindexRefreshed func()
++
+ func FullReindex(needResetScroll bool) {
+ 	util.PushEndlessProgress(Conf.language(35))
+ 
+ 	task.AppendTask(task.DatabaseIndexFull, fullReindex)
+ 	task.AppendTask(task.DatabaseIndexRef, IndexRefs)
+ 	go func() {
++		if hook := testHookFullReindexRefreshed; nil != hook {
++			defer hook()
++		}
+ 		sql.FlushQueue()
+ 		ResetVirtualBlockRefCache()
+ 	}()
+diff --git a/kernel/model/challenge_step4_fts5_test.go b/kernel/model/challenge_step4_fts5_test.go
+new file mode 100644
+index 0000000..c559cb7
+--- /dev/null
++++ b/kernel/model/challenge_step4_fts5_test.go
+@@ -0,0 +1,328 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++import (
++	"os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/dejavu"
++	"github.com/siyuan-note/dejavu/cloud"
++	"github.com/siyuan-note/eventbus"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Step 4's challenger: the sync's raise comes after its upload.
++
++// syncIndexUploadProbe, when set, runs each time a sync is about to upload an index to the cloud. A two-way sync
++// (dejavu's Repo.Sync) does that only after it has written the cloud's files into the data folder (restoreFiles) and
++// indexed the merge, and before it returns.
++var syncIndexUploadProbe atomic.Pointer[func()]
++var subscribeSyncIndexUploadProbe sync.Once
++
++func probeSyncIndexUpload(t *testing.T, probe func()) {
++	t.Helper()
++	subscribeSyncIndexUploadProbe.Do(func() {
++		// eventbus has no unsubscribe: the handler stays, and does nothing while no probe is set.
++		if err := eventbus.Subscribe(eventbus.EvtCloudBeforeUploadIndex, func(context map[string]any, id string) {
++			if p := syncIndexUploadProbe.Load(); nil != p {
++				(*p)()
++			}
++		}); nil != err {
++			t.Fatal(err)
++		}
++	})
++	syncIndexUploadProbe.Store(&probe)
++	t.Cleanup(func() { syncIndexUploadProbe.Store(nil) })
++}
++
++// A two-way sync (the sync job, the API's sync, boot and perception sync all reach syncRepoWithPublication), here
++// with a cloud in a local folder that another device has published a page's new copy to. dejavu writes the cloud's
++// copy over the page's file (restoreFiles), then, since this device has changes of its own, indexes the merge and
++// uploads it: chunks, files, then the indexes and refs, each a network round trip on a real cloud. Only after
++// repo.Sync returns does raiseAfterSync raise everything. All that while, the caches serve the page as it was before
++// the sync, though its file holds the cloud's copy: a read gets the old copy, and a job that edits the page then saves
++// the old copy plus its edit over the cloud's, losing it, after which the next sync publishes the loss.
++//
++// dejavu publishes EvtCheckoutUpsertFile after each file it writes and EvtCheckoutRemoveFile after each file it
++// removes, in every sync, checkout and asset recovery, and SiYuan already subscribes to both (subscribeRepoEvents), so
++// a raise can follow each write there rather than the network calls. The test reads the page as SiYuan serves it
++// when the sync is about to upload its index, after it has written the page's file: it must read the cloud's copy.
++func TestSyncServesTheMergedPageWhileItUploads(t *testing.T) {
++	f := setupMoveCacheTest(t)
++	page := addOutsidePage(t, f.work, "20261018010101-mrgpage", "old")
++	pageData, err := os.ReadFile(page.absPath())
++	if nil != err {
++		t.Fatal(err)
++	}
++
++	base := t.TempDir()
++	remote := filepath.Join(base, "cloud")
++	if err = os.MkdirAll(remote, 0755); nil != err {
++		t.Fatal(err)
++	}
++	key := []byte("0123456789abcdef0123456789abcdef")
++	previousWorkspace, previousRepo, previousStatusBar := util.WorkspaceDir, util.RepoDir, util.StatusBarCfg.Load()
++	t.Cleanup(func() {
++		util.WorkspaceDir, util.RepoDir = previousWorkspace, previousRepo
++		util.StatusBarCfg.Store(previousStatusBar)
++	})
++	util.WorkspaceDir = filepath.Dir(util.DataDir)
++	util.RepoDir = filepath.Join(base, "repo")
++	util.StatusBarCfg.Store(&util.StatusBar{MsgDataSyncDisabled: true})
++	syncConf, repoConf, systemConf := conf.NewSync(), conf.NewRepo(), conf.NewSystem()
++	syncConf.Provider, syncConf.CloudName, syncConf.Enabled = conf.ProviderLocal, "main", true
++	syncConf.Local = &conf.Local{Endpoint: remote}
++	repoConf.Key = key
++	systemConf.ID, systemConf.Name, systemConf.OS = "kernel-device", "kernel-device", "linux"
++	Conf.Sync.Store(syncConf)
++	Conf.Repo.Store(repoConf)
++	Conf.System.Store(systemConf)
++	Conf.Search.Store(conf.NewSearch())
++
++	// The other device holds the same workspace with the page's new copy, saved an hour later, so the merge takes the
++	// cloud's copy (dejavu keeps the local one only when it isn't over 7 minutes older). Every other file carries the
++	// same time on both devices.
++	if err = os.MkdirAll(filepath.Join(util.DataDir, ".siyuan"), 0755); nil != err {
++		t.Fatal(err)
++	}
++	if err = os.WriteFile(filepath.Join(util.DataDir, ".siyuan", "syncignore"), nil, 0644); nil != err {
++		t.Fatal(err)
++	}
++	otherDir := filepath.Join(base, "other")
++	otherData := filepath.Join(otherDir, "data")
++	if err = os.CopyFS(otherData, os.DirFS(util.DataDir)); nil != err {
++		t.Fatal(err)
++	}
++	otherPage := filepath.Join(otherData, f.work, page.path())
++	if err = os.WriteFile(otherPage, replaceOutsideJSONString(t, pageData, "custom-v", "old", "new"), 0644); nil != err {
++		t.Fatal(err)
++	}
++	for _, dir := range []string{util.DataDir, otherData} {
++		stampOutsideFiles(t, dir, time.Unix(1700000010, 0))
++	}
++	if err = os.Chtimes(otherPage, time.Unix(1700003610, 0), time.Unix(1700003610, 0)); nil != err {
++		t.Fatal(err)
++	}
++	backend := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "main", RepoPath: filepath.Join(otherDir, "repo"),
++		AvailableSize: 1 << 30, Local: &cloud.ConfLocal{Endpoint: remote}}})
++	other, err := dejavu.NewRepo(otherData, filepath.Join(otherDir, "repo"), filepath.Join(otherDir, "history"),
++		filepath.Join(otherDir, "temp"), "other-device", "other-device", "linux", key, nil, backend)
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, err = other.Index("other device", true, nil); nil != err {
++		t.Fatal(err)
++	}
++	if _, _, err = other.Sync(nil); nil != err {
++		t.Fatalf("the other device's sync failed: %v", err)
++	}
++
++	repo, err := newSyncRepository()
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, _, err = indexRepoBeforeCloudSync(repo); nil != err {
++		t.Fatalf("setup: index this device's data failed: %v", err)
++	}
++	clearOutsideCaches()
++	page.read(t, "old")
++
++	var fired bool
++	var fileDuring, servedDuring string
++	probeSyncIndexUpload(t, func() {
++		if fired {
++			return
++		}
++		fired = true
++		if data, readErr := os.ReadFile(page.absPath()); nil == readErr && nil != outsideJSONString(data, "custom-v", "new") {
++			fileDuring = "new"
++		}
++		servedDuring = sql.GetBlockAttrs(page.id)["custom-v"]
++	})
++	mergeResult, _, _, err := syncRepoWithPublication(repo, newSyncContext())
++	if nil != err {
++		t.Fatalf("the sync failed: %v", err)
++	}
++	if !fired {
++		t.Fatalf("setup: the sync uploaded no index (merge result: %d upserts, %d removes, %d conflicts)",
++			len(mergeResult.Upserts), len(mergeResult.Removes), mergeResult.ConflictCount())
++	}
++	if "new" != fileDuring {
++		t.Fatal("setup: the page's file didn't hold the cloud's copy when the sync uploaded its index")
++	}
++	if "new" != servedDuring {
++		t.Errorf("while the sync uploaded, after it had written the cloud's copy of the page, getBlockAttrs gave the "+
++			"page custom-v=%q, though its file held \"new\"", servedDuring)
++	}
++	page.check(t, "after the sync", "new")
++}
++
++// Fix round 1 re-check: a page a two-way sync removes, with dejavu's on-demand asset downloads on.
++//
++// With asset downloads on demand (Sync's "download assets when needed", conf AssetDownloadMode 1), dejavu applies a
++// sync's merge in recoverAssetApply instead of restoreFiles: it writes the merge's files through checkoutFile, which
++// sends EvtCheckoutUpsertFile, but removes the merge's removed files with a bare os.Remove, which sends no event. It then
++// uploads and updates the cloud's indexes, and only once Sync returns does raiseAfterSync raise the removed files by
++// path. So all through the upload, a page the sync removed is served as it was: getBlockAttrs gives its attributes, the
++// page tree its page attributes, and WriteTree's skip lookup takes a save of it as already written. With assets
++// downloaded with the sync (mode 0), removeFiles sends EvtCheckoutRemoveFile after each remove, and the page reads as
++// removed. The test has this device sync once, the other device remove a page and publish, and this device change
++// another page, so that its second sync both removes the page and uploads; when it is about to upload its index, the
++// page's file is gone, and getBlockAttrs must give the page nothing.
++func TestSyncServesNoRemovedPageWhileItUploads(t *testing.T) {
++	for _, c := range []struct {
++		name string
++		mode int
++	}{{"assets downloaded with the sync", 0}, {"assets downloaded on demand", 1}} {
++		t.Run(c.name, func(t *testing.T) {
++			if 1 == c.mode {
++				// The coordinator's decision in step 4's fix round 2, a known gap: dejavu's recoverAssetApply removes the
++				// merge's removed files with a bare os.Remove and sends no event, so a page the sync removes stays served
++				// until Sync returns. The fix in one place is in dejavu (publish EvtCheckoutRemoveFile after that remove),
++				// outside the patches to SiYuan's own tree.
++				t.Skip("known gap: dejavu's recoverAssetApply removes files with no EvtCheckoutRemoveFile; fix in dejavu")
++			}
++			f := setupMoveCacheTest(t)
++			removed := addOutsidePage(t, f.work, "20261018040101-rmvpage", "kept")
++			changed := addOutsidePage(t, f.work, "20261018040102-chgpage", "before")
++
++			base := t.TempDir()
++			remote := filepath.Join(base, "cloud")
++			if err := os.MkdirAll(remote, 0755); nil != err {
++				t.Fatal(err)
++			}
++			key := []byte("0123456789abcdef0123456789abcdef")
++			previousWorkspace, previousRepo, previousStatusBar := util.WorkspaceDir, util.RepoDir, util.StatusBarCfg.Load()
++			t.Cleanup(func() {
++				util.WorkspaceDir, util.RepoDir = previousWorkspace, previousRepo
++				util.StatusBarCfg.Store(previousStatusBar)
++			})
++			util.WorkspaceDir = filepath.Dir(util.DataDir)
++			util.RepoDir = filepath.Join(base, "repo")
++			util.StatusBarCfg.Store(&util.StatusBar{MsgDataSyncDisabled: true})
++			syncConf, repoConf, systemConf := conf.NewSync(), conf.NewRepo(), conf.NewSystem()
++			syncConf.Provider, syncConf.CloudName, syncConf.Enabled = conf.ProviderLocal, "main", true
++			syncConf.Local = &conf.Local{Endpoint: remote}
++			syncConf.AssetDownloadMode = c.mode
++			repoConf.Key = key
++			systemConf.ID, systemConf.Name, systemConf.OS = "kernel-device", "kernel-device", "linux"
++			Conf.Sync.Store(syncConf)
++			Conf.Repo.Store(repoConf)
++			Conf.System.Store(systemConf)
++			Conf.Search.Store(conf.NewSearch())
++			if err := os.MkdirAll(filepath.Join(util.DataDir, ".siyuan"), 0755); nil != err {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(filepath.Join(util.DataDir, ".siyuan", "syncignore"), nil, 0644); nil != err {
++				t.Fatal(err)
++			}
++
++			// The other device holds the same workspace and publishes it first.
++			otherDir := filepath.Join(base, "other")
++			otherData := filepath.Join(otherDir, "data")
++			if err := os.CopyFS(otherData, os.DirFS(util.DataDir)); nil != err {
++				t.Fatal(err)
++			}
++			for _, dir := range []string{util.DataDir, otherData} {
++				stampOutsideFiles(t, dir, time.Unix(1700000010, 0))
++			}
++			backend := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "main", RepoPath: filepath.Join(otherDir, "repo"),
++				AvailableSize: 1 << 30, Local: &cloud.ConfLocal{Endpoint: remote}}})
++			other, err := dejavu.NewRepo(otherData, filepath.Join(otherDir, "repo"), filepath.Join(otherDir, "history"),
++				filepath.Join(otherDir, "temp"), "other-device", "other-device", "linux", key, nil, backend)
++			if nil != err {
++				t.Fatal(err)
++			}
++			if _, err = other.Index("other device", true, nil); nil != err {
++				t.Fatal(err)
++			}
++			if _, _, err = other.Sync(nil); nil != err {
++				t.Fatalf("setup: the other device's first sync failed: %v", err)
++			}
++
++			// This device syncs once, which gives both devices the same sync point.
++			repo, err := newSyncRepository()
++			if nil != err {
++				t.Fatal(err)
++			}
++			if _, _, err = indexRepoBeforeCloudSync(repo); nil != err {
++				t.Fatalf("setup: index this device's data failed: %v", err)
++			}
++			if _, _, _, err = syncRepoWithPublication(repo, newSyncContext()); nil != err {
++				t.Fatalf("setup: this device's first sync failed: %v", err)
++			}
++
++			// The other device removes the page and publishes; this device changes another page.
++			if err = os.Remove(filepath.Join(otherData, f.work, removed.path())); nil != err {
++				t.Fatal(err)
++			}
++			if _, err = other.Index("other device removes a page", true, nil); nil != err {
++				t.Fatal(err)
++			}
++			if _, _, err = other.Sync(nil); nil != err {
++				t.Fatalf("setup: the other device's second sync failed: %v", err)
++			}
++			changed.setValue(t, "after")
++			if _, _, err = indexRepoBeforeCloudSync(repo); nil != err {
++				t.Fatalf("setup: index this device's change failed: %v", err)
++			}
++			clearOutsideCaches()
++			removed.read(t, "kept")
++
++			var fired, goneDuring bool
++			var servedDuring map[string]string
++			probeSyncIndexUpload(t, func() {
++				if fired {
++					return
++				}
++				fired = true
++				_, statErr := os.Stat(removed.absPath())
++				goneDuring = os.IsNotExist(statErr)
++				servedDuring = sql.GetBlockAttrs(removed.id)
++			})
++			mergeResult, _, _, err := syncRepoWithPublication(repo, newSyncContext())
++			if nil != err {
++				t.Fatalf("the sync failed: %v", err)
++			}
++			if 1 != len(mergeResult.Removes) {
++				t.Fatalf("setup: the sync removed %d files, not the page", len(mergeResult.Removes))
++			}
++			if !fired {
++				t.Fatal("setup: the sync uploaded no index")
++			}
++			if !goneDuring {
++				t.Fatal("setup: the page's file was still there when the sync uploaded its index")
++			}
++			if 0 < len(servedDuring) {
++				t.Errorf("while the sync uploaded, after it had removed the page's file, getBlockAttrs gave the page "+
++					"the attributes %v", servedDuring)
++			}
++			if got := sql.GetBlockAttrs(removed.id); 0 < len(got) {
++				t.Errorf("after the sync, getBlockAttrs gives the removed page the attributes %v", got)
++			}
++		})
++	}
++}
+diff --git a/kernel/model/conf.go b/kernel/model/conf.go
+index aad43e7..3ee3c9f 100644
+--- a/kernel/model/conf.go
++++ b/kernel/model/conf.go
+@@ -1369,7 +1369,7 @@ func closeUserGuide() {
+ 		boxConfPath := filepath.Join(boxDirPath, ".siyuan", "conf.json")
+ 		if !filelock.IsExist(boxConfPath) {
+ 			logging.LogWarnf("found a corrupted user guide box [%s]", boxDirPath)
+-			if removeErr := filelock.Remove(boxDirPath); nil != removeErr {
++			if removeErr := removeDataPath(boxDirPath); nil != removeErr {
+ 				logging.LogErrorf("remove corrupted user guide box [%s] failed: %s", boxDirPath, removeErr)
+ 			} else {
+ 				logging.LogInfof("removed corrupted user guide box [%s]", boxDirPath)
+@@ -1380,7 +1380,7 @@ func closeUserGuide() {
+ 		data, readErr := filelock.ReadFile(boxConfPath)
+ 		if nil != readErr {
+ 			logging.LogErrorf("read box conf [%s] failed: %s", boxConfPath, readErr)
+-			if removeErr := filelock.Remove(boxDirPath); nil != removeErr {
++			if removeErr := removeDataPath(boxDirPath); nil != removeErr {
+ 				logging.LogErrorf("remove corrupted user guide box [%s] failed: %s", boxDirPath, removeErr)
+ 			} else {
+ 				logging.LogInfof("removed corrupted user guide box [%s]", boxDirPath)
+@@ -1389,7 +1389,7 @@ func closeUserGuide() {
+ 		}
+ 		if readErr = gulu.JSON.UnmarshalJSON(data, boxConf); nil != readErr {
+ 			logging.LogErrorf("parse box conf [%s] failed: %s", boxConfPath, readErr)
+-			if removeErr := filelock.Remove(boxDirPath); nil != removeErr {
++			if removeErr := removeDataPath(boxDirPath); nil != removeErr {
+ 				logging.LogErrorf("remove corrupted user guide box [%s] failed: %s", boxDirPath, removeErr)
+ 			} else {
+ 				logging.LogInfof("removed corrupted user guide box [%s]", boxDirPath)
+diff --git a/kernel/model/crypto.go b/kernel/model/crypto.go
+index b338dc2..6a0f3d4 100644
+--- a/kernel/model/crypto.go
++++ b/kernel/model/crypto.go
+@@ -2771,7 +2771,7 @@ func cleanupFailedEncryptedBox(boxID string) {
+ 	removeEncryptedBoxLifecycle(boxID)
+ 	forgetRuntimeEncryptedBox(boxID)
+ 	removeMasterPasswordMigrationBox(boxID)
+-	if err := filelock.Remove(boxDir); err != nil {
++	if err := removeDataPath(boxDir); err != nil {
+ 		logging.LogErrorf("cleanup failed encrypted box [%s]: %s", boxID, err)
+ 	}
+ }
+diff --git a/kernel/model/duplicate_doc_tree.go b/kernel/model/duplicate_doc_tree.go
+index 6c752d7..8d22272 100644
+--- a/kernel/model/duplicate_doc_tree.go
++++ b/kernel/model/duplicate_doc_tree.go
+@@ -313,7 +313,10 @@ func (plan *duplicateDocTreePlan) commit(writeTree func(*parse.Tree) (uint64, er
+ 		for i := len(attempted) - 1; i >= 0; i-- {
+ 			tree := attempted[i]
+ 			abs := filepath.Join(util.DataDir, tree.Box, tree.Path)
+-			if removeErr := os.Remove(abs); removeErr != nil && !os.IsNotExist(removeErr) {
++			endWrite := filesys.BeginDataPathWrite(abs)
++			removeErr := os.Remove(abs)
++			endWrite()
++			if removeErr != nil && !os.IsNotExist(removeErr) {
+ 				err = errors.Join(err, removeErr)
+ 			}
+ 			cache.RemoveTreeDataInBox(tree.ID, tree.Box)
+diff --git a/kernel/model/file.go b/kernel/model/file.go
+index d6b3b4b..2efb5b4 100644
+--- a/kernel/model/file.go
++++ b/kernel/model/file.go
+@@ -210,7 +210,8 @@ func (box *Box) moveCorruptedData(filePath string) {
+ 		logging.LogErrorf("copy corrupted data file [%s] failed: %s", filePath, copyErr)
+ 		return
+ 	}
+-	if removeErr := filelock.Remove(filePath); nil != removeErr {
++	removeErr := removeDataPath(filePath)
++	if nil != removeErr {
+ 		logging.LogErrorf("remove corrupted data file [%s] failed: %s", filePath, removeErr)
+ 		return
+ 	}
+@@ -1971,9 +1972,11 @@ func moveDoc(fromBox *Box, fromPath string, toBox *Box, toPath string, luteEngin
+ 			absFromPath := filepath.Join(util.DataDir, fromBox.ID, fromFolder)
+ 			absToPath := filepath.Join(util.DataDir, toBox.ID, newFolder)
+ 			if filelock.IsExist(absToPath) {
+-				filelock.Remove(absToPath)
++				removeDataPath(absToPath)
+ 			}
+-			if err = filelock.Rename(absFromPath, absToPath); err != nil {
++			err = filelock.Rename(absFromPath, absToPath)
++			filesys.RaiseForDataPath(absFromPath, absToPath)
++			if err != nil {
+ 				msg := fmt.Sprintf(Conf.Language(5), fromBox.Name, fromPath, err)
+ 				logging.LogErrorf("move [path=%s] in box [%s] failed: %s", fromPath, fromBox.ID, err)
+ 				err = errors.New(msg)
+@@ -1998,7 +2001,9 @@ func moveDoc(fromBox *Box, fromPath string, toBox *Box, toPath string, luteEngin
+ 	} else {
+ 		absFromPath := filepath.Join(util.DataDir, fromBox.ID, fromPath)
+ 		absToPath := filepath.Join(util.DataDir, toBox.ID, newPath)
+-		if err = filelock.Rename(absFromPath, absToPath); err != nil {
++		err = filelock.Rename(absFromPath, absToPath)
++		filesys.RaiseForDataPath(absFromPath, absToPath)
++		if err != nil {
+ 			msg := fmt.Sprintf(Conf.Language(5), fromBox.Name, fromPath, err)
+ 			logging.LogErrorf("move [path=%s] in box [%s] failed: %s", fromPath, fromBox.ID, err)
+ 			err = errors.New(msg)
+diff --git a/kernel/model/history.go b/kernel/model/history.go
+index 605bfa6..67a8033 100644
+--- a/kernel/model/history.go
++++ b/kernel/model/history.go
+@@ -470,7 +470,9 @@ func RollbackDocHistory(historyPath string) (err error) {
+ 	}
+ 	if workingDoc != nil {
+ 		if workingDoc.Type == "d" && workingDoc.Path != tree.Path {
+-			if err = filelock.Remove(filepath.Join(util.DataDir, boxID, workingDoc.Path)); err != nil {
++			workingDocPath := filepath.Join(util.DataDir, boxID, workingDoc.Path)
++			err = removeDataPath(workingDocPath)
++			if err != nil {
+ 				return
+ 			}
+ 		}
+@@ -674,7 +676,9 @@ func RollbackNotebookHistory(historyPath string) (err error) {
+ 		return err
+ 	}
+ 
+-	if err = filelock.CopyNewtimes(from, to); err != nil {
++	err = filelock.CopyNewtimes(from, to)
++	filesys.RaiseForDataPath(to)
++	if err != nil {
+ 		logging.LogErrorf("copy file [%s] to [%s] failed: %s", from, to, err)
+ 		return
+ 	}
+@@ -733,7 +737,10 @@ func RollbackAttributeViewHistory(historyPath string) (err error) {
+ 		}
+ 	}
+ 
+-	if err = filelock.CopyNewtimes(from, to); err != nil {
++	err = filelock.CopyNewtimes(from, to)
++	// Raised whether or not the copy finished: a failed copy may have truncated the file.
++	filesys.RaiseForDataPath(to)
++	if err != nil {
+ 		logging.LogErrorf("copy file [%s] to [%s] failed: %s", from, to, err)
+ 		return
+ 	}
+diff --git a/kernel/model/import.go b/kernel/model/import.go
+index 6a2ffbb..22d9d67 100644
+--- a/kernel/model/import.go
++++ b/kernel/model/import.go
+@@ -541,7 +541,9 @@ func importSY0(zipPath, boxID, toPath string, createNotebook, autoDetect bool, s
+ 			}
+ 			treenode.RemoveBlockTreesByBoxID(boxID)
+ 			sql.DeleteBoxQueue(boxID)
+-			if removeErr := filelock.Remove(filepath.Join(util.DataDir, boxID)); removeErr != nil {
++			boxDir := filepath.Join(util.DataDir, boxID)
++			removeErr := removeDataPath(boxDir)
++			if removeErr != nil {
+ 				logging.LogErrorf("remove notebook [%s] after import failed: %s", boxID, removeErr)
+ 			}
+ 		}()
+@@ -802,7 +804,9 @@ func importSY0(zipPath, boxID, toPath string, createNotebook, autoDetect bool, s
+ 		// 需要先加密写入 <boxID>/storage/av/，后续 mirror/relation 操作才能正确路由
+ 		if !IsEncryptedBox(boxID) {
+ 			targetStorageAvDir := filepath.Join(util.DataDir, "storage", "av")
+-			if copyErr := filelock.Copy(storageAvDir, targetStorageAvDir); nil != copyErr {
++			copyErr := filelock.Copy(storageAvDir, targetStorageAvDir)
++			filesys.RaiseForDataCopy(storageAvDir, targetStorageAvDir)
++			if nil != copyErr {
+ 				logging.LogErrorf("copy storage av dir from [%s] to [%s] failed: %s", storageAvDir, targetStorageAvDir, copyErr)
+ 				err = copyErr
+ 				return
+@@ -1105,7 +1109,9 @@ func importSY0(zipPath, boxID, toPath string, createNotebook, autoDetect bool, s
+ 		return nil
+ 	})
+ 
+-	if err = filelock.Copy(unzipRootPath, targetDir); err != nil {
++	err = filelock.Copy(unzipRootPath, targetDir)
++	filesys.RaiseForDataCopy(unzipRootPath, targetDir)
++	if err != nil {
+ 		logging.LogErrorf("copy data dir from [%s] to [%s] failed: %s", unzipRootPath, util.DataDir, err)
+ 		err = errors.New("copy data failed")
+ 		return
+@@ -1418,7 +1424,10 @@ func ImportData(zipPath string) (err error) {
+ 	if err != nil {
+ 		return err
+ 	}
+-	if err = filelock.Copy(tmpDataPath, util.DataDir); err != nil {
++	err = filelock.Copy(tmpDataPath, util.DataDir)
++	// The copy wrote over the whole data folder behind the caches, even if it failed part way.
++	cache.RaiseAll()
++	if err != nil {
+ 		logging.LogErrorf("copy data dir from [%s] to [%s] failed: %s", tmpDataPath, util.DataDir, err)
+ 		err = errors.New("copy data failed")
+ 		return
+@@ -2158,7 +2167,10 @@ func encryptBoxAVFiles(boxID, storageAvDir string) error {
+ 		if encErr != nil {
+ 			return encErr
+ 		}
+-		return os.WriteFile(filepath.Join(boxAVDir, d.Name()), enc, 0644)
++		avPath := filepath.Join(boxAVDir, d.Name())
++		writeErr := os.WriteFile(avPath, enc, 0644)
++		filesys.RaiseForDataPath(avPath)
++		return writeErr
+ 	})
+ }
+ 
+diff --git a/kernel/model/import_obsidian.go b/kernel/model/import_obsidian.go
+index 5c2c4c8..aca4ead 100644
+--- a/kernel/model/import_obsidian.go
++++ b/kernel/model/import_obsidian.go
+@@ -43,6 +43,7 @@ import (
+ 	"github.com/88250/lute/render"
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+@@ -2438,7 +2439,9 @@ func copyObsidianTreeFiles(sourceRoot, destinationRoot string) error {
+ 		if entry.Type()&os.ModeSymlink != 0 {
+ 			return errors.New("staged document tree contains a symbolic link")
+ 		}
+-		return filelock.Copy(current, destination)
++		copyErr := filelock.Copy(current, destination)
++		filesys.RaiseForDataPath(destination)
++		return copyErr
+ 	})
+ }
+ 
+diff --git a/kernel/model/index_fix.go b/kernel/model/index_fix.go
+index 97ef16f..4f5089c 100644
+--- a/kernel/model/index_fix.go
++++ b/kernel/model/index_fix.go
+@@ -333,13 +333,16 @@ func recreateTree(tree *parse.Tree, absPath string) {
+ 		// 重命名子文档文件夹
+ 		from := strings.TrimSuffix(absPath, ".sy")
+ 		to := filepath.Join(filepath.Dir(absPath), tree.ID)
+-		if renameErr := os.Rename(from, to); nil != renameErr {
++		renameErr := os.Rename(from, to)
++		filesys.RaiseForDataPath(from, to)
++		if nil != renameErr {
+ 			logging.LogWarnf("rename [%s] failed: %s", from, renameErr)
+ 			return
+ 		}
+ 	}
+ 
+-	if err := filelock.Remove(absPath); err != nil {
++	err := removeDataPath(absPath)
++	if err != nil {
+ 		logging.LogWarnf("remove [%s] failed: %s", absPath, err)
+ 		return
+ 	}
+diff --git a/kernel/model/mount.go b/kernel/model/mount.go
+index 300d18e..d3ee8b6 100644
+--- a/kernel/model/mount.go
++++ b/kernel/model/mount.go
+@@ -34,6 +34,7 @@ import (
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/av"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/sql"
+ 	"github.com/siyuan-note/siyuan/kernel/task"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
+@@ -106,7 +107,8 @@ func createBox(name string, initializeBoxDoc bool) (id string, err error) {
+ 		if _, err = ensureBoxDoc0(id); err != nil {
+ 			treenode.RemoveBlockTreesByBoxID(id)
+ 			sql.DeleteBoxQueue(id)
+-			if removeErr := filelock.Remove(boxLocalPath); nil != removeErr {
++			removeErr := removeDataPath(boxLocalPath)
++			if nil != removeErr {
+ 				logging.LogErrorf("remove box [%s] after initializing box document failed: %s", id, removeErr)
+ 			}
+ 			return "", err
+@@ -189,6 +191,9 @@ func isEncryptedBoxMounted(boxID string) bool {
+ // Go 的 os.RemoveAll 在 Windows 上遇到"目录非空"（并发写入或句柄占用）不会重试，
+ // 因此这里在每次重试前主动清空残留内容，并在最终失败时返回残留条目供定位。
+ func removeBoxDir(p string) (err error) {
++	// The remove bypasses WriteTree and saveAttributeView: raise every page and database it takes away once it has.
++	endWrite := filesys.BeginDataPathWrite(p)
++	defer endWrite()
+ 	for i := 0; i < 5; i++ {
+ 		err = filelock.RemoveWithoutFatal(p)
+ 		if nil == err {
+@@ -416,7 +421,8 @@ func RemoveBox(boxID string) (err error) {
+ 		if avFiles, readAvErr := getUserGuideAVJSONFiles(boxID); nil == readAvErr {
+ 			for _, avName := range avFiles {
+ 				avFilePath := filepath.Join(util.DataDir, "storage", "av", avName)
+-				if removeErr := filelock.Remove(avFilePath); nil != removeErr {
++				removeErr := removeDataPath(avFilePath)
++				if nil != removeErr {
+ 					logging.LogErrorf("remove av file [%s] failed: %s", avFilePath, removeErr)
+ 				} else {
+ 					logging.LogDebugf("removed av file [%s]", avFilePath)
+@@ -544,6 +550,7 @@ func mountBox(boxID string) (alreadyMount bool, err error) {
+ 
+ 		p := filepath.Join(util.WorkingDir, "guide", boxID)
+ 		if err = filelock.Copy(p, localPath); err != nil {
++			cache.RaiseAll() // the copy may have written part of the guide
+ 			return
+ 		}
+ 
+@@ -555,9 +562,12 @@ func mountBox(boxID string) (alreadyMount bool, err error) {
+ 
+ 		avDirPath := filepath.Join(util.WorkingDir, "guide", boxID, "storage", "av")
+ 		if filelock.IsExist(avDirPath) {
+-			if err = filelock.Copy(avDirPath, filepath.Join(util.DataDir, "storage", "av")); err != nil {
+-				return
+-			}
++			err = filelock.Copy(avDirPath, filepath.Join(util.DataDir, "storage", "av"))
++		}
++		// The guide's pages and databases were copied in behind the caches; the clears above ran between the two copies.
++		cache.RaiseAll()
++		if err != nil {
++			return
+ 		}
+ 
+ 		if box := Conf.Box(boxID); nil != box {
+diff --git a/kernel/model/notebook_archive.go b/kernel/model/notebook_archive.go
+index e34a25a..e593dae 100644
+--- a/kernel/model/notebook_archive.go
++++ b/kernel/model/notebook_archive.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/siyuan-note/dejavu/entity"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/sql"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+@@ -551,7 +552,10 @@ func CommitNotebookArchive(id string, saved bool) error {
+ 		source, _ := archiveSourcePath(root)
+ 		destination := filepath.Join(directory, "removed", filepath.FromSlash(root))
+ 		if err = os.MkdirAll(filepath.Dir(destination), 0700); err == nil {
++			// The move takes the notebook out of data/: raise what it held once it has.
++			endWrite := filesys.BeginDataPathWrite(source)
+ 			err = os.Rename(source, destination)
++			endWrite()
+ 		}
+ 		if err != nil {
+ 			if rollbackErr := rollbackNotebookArchive(directory, operation); rollbackErr != nil {
+@@ -604,7 +608,9 @@ func rollbackNotebookArchive(directory string, operation *notebookArchiveOperati
+ 		if err = os.MkdirAll(filepath.Dir(source), 0700); err != nil {
+ 			return err
+ 		}
+-		if err = os.Rename(removed, source); err != nil {
++		err = os.Rename(removed, source)
++		filesys.RaiseForDataPath(source)
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/kernel/model/notebook_archive_import.go b/kernel/model/notebook_archive_import.go
+index 605f475..29e7e0d 100644
+--- a/kernel/model/notebook_archive_import.go
++++ b/kernel/model/notebook_archive_import.go
+@@ -122,6 +122,7 @@ func ImportNotebookArchive(archivePath, password string, keyData []byte) error {
+ 		destination, _ := archiveSourcePath(root)
+ 		if err = os.MkdirAll(filepath.Dir(destination), 0700); err == nil {
+ 			err = os.Rename(filepath.Join(install, filepath.FromSlash(root)), destination)
++			filesys.RaiseForDataPath(destination)
+ 		}
+ 		if err != nil {
+ 			if rollbackErr := rollbackNotebookArchiveImport(directory, operation); rollbackErr != nil {
+@@ -405,7 +406,10 @@ func rollbackNotebookArchiveImport(directory string, operation *notebookArchiveO
+ 		if err = os.MkdirAll(filepath.Dir(staged), 0700); err != nil {
+ 			return err
+ 		}
+-		if err = os.Rename(destination, staged); err != nil {
++		endWrite := filesys.BeginDataPathWrite(destination)
++		err = os.Rename(destination, staged)
++		endWrite()
++		if err != nil {
+ 			return err
+ 		}
+ 	}
+diff --git a/kernel/model/notebook_bundle.go b/kernel/model/notebook_bundle.go
+index d2be611..8a0e928 100644
+--- a/kernel/model/notebook_bundle.go
++++ b/kernel/model/notebook_bundle.go
+@@ -299,7 +299,7 @@ func ImportSYNotebookBundle(zipPath string) (boxIDs []string, bundle bool, err e
+ 		for _, boxID := range boxIDs {
+ 			treenode.RemoveBlockTreesByBoxID(boxID)
+ 			sql.DeleteBoxQueue(boxID)
+-			_ = filelock.Remove(filepath.Join(util.DataDir, boxID))
++			_ = removeDataPath(filepath.Join(util.DataDir, boxID))
+ 		}
+ 	}()
+ 	for _, notebook := range notebooks {
+diff --git a/kernel/model/outside_writers_fts5_test.go b/kernel/model/outside_writers_fts5_test.go
+new file mode 100644
+index 0000000..52894a5
+--- /dev/null
++++ b/kernel/model/outside_writers_fts5_test.go
+@@ -0,0 +1,513 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++import (
++	archivezip "archive/zip"
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/dejavu"
++	"github.com/siyuan-note/dejavu/cloud"
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++var fullReindexRefreshed = make(chan struct{}, 1)
++
++func init() {
++	testHookFullReindexRefreshed = func() {
++		select {
++		case fullReindexRefreshed <- struct{}{}:
++		default:
++		}
++	}
++}
++
++// waitFullReindexRefreshed comes just before a call that starts a full reindex: ImportData, or a sync that changes
++// more than a fifth of the pages. FullReindex starts a goroutine that flushes SQL's queue and resets the virtual
++// reference cache, which reads Conf, so the test waits for it in a cleanup that runs before its fixtures set Conf back.
++func waitFullReindexRefreshed(t *testing.T) {
++	t.Helper()
++	select {
++	case <-fullReindexRefreshed:
++	default:
++	}
++	t.Cleanup(func() {
++		select {
++		case <-fullReindexRefreshed:
++		case <-time.After(10 * time.Second):
++			if !t.Failed() {
++				t.Error("FullReindex's goroutine didn't finish within 10 s")
++			}
++		}
++	})
++}
++
++// waitOutsideCached waits up to 200 ms for the cache to take in what a read stored: ristretto takes a store in on a
++// goroutine of its own, and a read straight after it would miss and read the file, which would hide the fault.
++func waitOutsideCached(t *testing.T, what string, cached func() bool) {
++	t.Helper()
++	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
++		if cached() {
++			return
++		}
++	}
++	t.Fatalf("setup: %s", what)
++}
++
++// outsideJSONString is "name":"value" as SiYuan writes it in a page's or a database's file, on one line or indented.
++func outsideJSONString(data []byte, name, value string) []byte {
++	for _, separator := range []string{":", ": "} {
++		if s := []byte(`"` + name + `"` + separator + `"` + value + `"`); bytes.Contains(data, s) {
++			return s
++		}
++	}
++	return nil
++}
++
++// replaceOutsideJSONString is data, a file SiYuan wrote, with "name":"old" replaced by "name":"new".
++func replaceOutsideJSONString(t *testing.T, data []byte, name, old, new string) []byte {
++	t.Helper()
++	from := outsideJSONString(data, name, old)
++	if nil == from {
++		t.Fatalf("setup: the file holds no %q: %q", name, old)
++	}
++	return bytes.Replace(data, from, bytes.Replace(from, []byte(`"`+old+`"`), []byte(`"`+new+`"`), 1), 1)
++}
++
++// requireOutsideFileHolds stops the test unless the file at absPath holds "name":"value": a writer under test that
++// wrote nothing would make every read look stale.
++func requireOutsideFileHolds(t *testing.T, step, absPath, name, value string) {
++	t.Helper()
++	data, err := os.ReadFile(absPath)
++	if nil != err {
++		t.Fatalf("%s: read %s failed: %v", step, absPath, err)
++	}
++	if nil == outsideJSONString(data, name, value) {
++		t.Fatalf("%s: %s doesn't hold %s=%q", step, absPath, name, value)
++	}
++}
++
++// outsidePage is a page at the top of a notebook whose root carries custom-v, and outsideDatabase a database, which
++// the tests below cache through SiYuan's own reads and then write through a bulk writer.
++type outsidePage struct {
++	boxID, id string
++	tree      *parse.Tree
++}
++
++func (p *outsidePage) path() string    { return "/" + p.id + ".sy" }
++func (p *outsidePage) absPath() string { return filepath.Join(util.DataDir, p.boxID, p.path()) }
++
++func addOutsidePage(t *testing.T, boxID, id, value string) *outsidePage {
++	t.Helper()
++	ret := &outsidePage{boxID: boxID, id: id}
++	ret.tree = treenode.NewTree(boxID, ret.path(), "/Outside "+id, "Outside "+id)
++	ret.setValue(t, value)
++	treenode.UpsertBlockTree(ret.tree)
++	return ret
++}
++
++// setValue saves the page with custom-v=value, as an edit does.
++func (p *outsidePage) setValue(t *testing.T, value string) {
++	t.Helper()
++	p.tree.Root.SetIALAttr("custom-v", value)
++	if _, err := filesys.WriteTree(p.tree); nil != err {
++		t.Fatalf("setup: write page %s failed: %v", p.id, err)
++	}
++}
++
++// read reads the page through SiYuan's own reads and caches it: getBlockAttrs loads the page, which fills the page
++// cache and the block attribute cache. One read: a second fill of a key ristretto hasn't taken in yet is turned away,
++// and the page cache then serves neither copy.
++func (p *outsidePage) read(t *testing.T, want string) {
++	t.Helper()
++	if got := sql.GetBlockAttrs(p.id)["custom-v"]; want != got {
++		t.Fatalf("setup: getBlockAttrs gives page %s custom-v=%q", p.id, got)
++	}
++	waitOutsideCached(t, "the page cache doesn't serve page "+p.id, func() bool {
++		_, ok := cache.GetTreeDataInBox(p.id, p.boxID)
++		return ok
++	})
++	waitOutsideCached(t, "the block attribute cache doesn't serve page "+p.id, func() bool {
++		return nil != cache.GetBlockIALInBox(p.id, p.boxID)
++	})
++}
++
++// check reads the page as SiYuan serves it, through getBlockAttrs and a page load, and wants custom-v=want, which its
++// file holds.
++func (p *outsidePage) check(t *testing.T, step, want string) {
++	t.Helper()
++	requireOutsideFileHolds(t, step, p.absPath(), "custom-v", want)
++	if got := sql.GetBlockAttrs(p.id)["custom-v"]; want != got {
++		t.Errorf("%s: getBlockAttrs gives page %s custom-v=%q, though its file holds %q", step, p.id, got, want)
++	}
++	tree, err := filesys.LoadTree(p.boxID, p.path(), util.NewLute())
++	if nil != err {
++		t.Errorf("%s: load page %s failed: %v", step, p.id, err)
++		return
++	}
++	if got := tree.Root.IALAttr("custom-v"); want != got {
++		t.Errorf("%s: page %s loads with custom-v=%q, though its file holds %q", step, p.id, got, want)
++	}
++}
++
++type outsideDatabase struct {
++	attrView *av.AttributeView
++}
++
++func saveOutsideDatabase(t *testing.T, id, name string) *outsideDatabase {
++	t.Helper()
++	ret := &outsideDatabase{attrView: &av.AttributeView{ID: id, Spec: av.RichTextSpec,
++		KeyValues: []*av.KeyValues{{Key: &av.Key{ID: id[:15] + "blockky", Name: "Name", Type: av.KeyTypeBlock}}},
++		Views: []*av.View{{ID: id[:15] + "tablevw", Name: "Table", LayoutType: av.LayoutTypeTable,
++			Table: av.NewLayoutTable(), PageSize: av.ViewDefaultPageSize}},
++		RenderedViewables: map[string]av.Viewable{}}}
++	ret.setName(t, name)
++	t.Cleanup(func() { cache.RemoveAVData(id) })
++	return ret
++}
++
++func (d *outsideDatabase) absPath() string { return av.GetAttributeViewDataPath(d.attrView.ID) }
++
++// setName saves the database named name, as an edit of it does.
++func (d *outsideDatabase) setName(t *testing.T, name string) {
++	t.Helper()
++	d.attrView.Name = name
++	if err := av.SaveAttributeView(d.attrView); nil != err {
++		t.Fatalf("setup: save database %s failed: %v", d.attrView.ID, err)
++	}
++}
++
++// read reads the database as every operation on it starts, which fills the database cache.
++func (d *outsideDatabase) read(t *testing.T, want string) {
++	t.Helper()
++	if attrView, err := av.ParseAttributeView(d.attrView.ID); nil != err || want != attrView.Name {
++		t.Fatalf("setup: database %s reads %v, %v", d.attrView.ID, attrView, err)
++	}
++	waitOutsideCached(t, "the database cache doesn't serve database "+d.attrView.ID, func() bool {
++		_, ok := cache.GetAVData(d.attrView.ID)
++		return ok
++	})
++}
++
++// check reads the database as every operation on it starts, and wants its name to be want, which its file holds.
++func (d *outsideDatabase) check(t *testing.T, step, want string) {
++	t.Helper()
++	requireOutsideFileHolds(t, step, d.absPath(), "name", want)
++	attrView, err := av.ParseAttributeView(d.attrView.ID)
++	if nil != err || nil == attrView {
++		t.Errorf("%s: read database %s failed: %v", step, d.attrView.ID, err)
++		return
++	}
++	if want != attrView.Name {
++		t.Errorf("%s: database %s reads with the name %q, though its file holds %q", step, d.attrView.ID, attrView.Name,
++			want)
++	}
++}
++
++// stampOutsideFiles gives every file under dir the modification time when.
++func stampOutsideFiles(t *testing.T, dir string, when time.Time) {
++	t.Helper()
++	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
++		if nil != err || d.IsDir() {
++			return err
++		}
++		return os.Chtimes(p, when, when)
++	})
++	if nil != err {
++		t.Fatal(err)
++	}
++}
++
++// clearOutsideCaches empties the four caches, as a restart does.
++func clearOutsideCaches(avIDs ...string) {
++	cache.ClearTreeCache()
++	cache.ClearBlocksIAL()
++	cache.ClearDocsIAL()
++	for _, avID := range avIDs {
++		cache.RemoveAVData(avID)
++	}
++}
++
++// C4 of step 3's caches challenger. A page turned into a heading of another page (/api/filetree/doc2Heading) has its
++// file removed raw, by box.Remove, and nothing raises the page: the write that now holds its block raises the target
++// page. So the source page's two entries that only its id or its path reach stay current, older than its file, which
++// is gone:
++//   - its page attributes, which the page tree reads by path (box.docIAL), are still served;
++//   - its page cache entry still stands for its file, so a save of the page as it was read before, whose bytes equal
++//     that entry, is skipped as already written (WriteTree's skip lookup), and the page's file isn't written at all.
++//
++// Both must read what the source page's file holds: nothing.
++func TestDocToHeadingLeavesNoCopyOfTheSourcePage(t *testing.T) {
++	const srcID, targetID, pivotID = "20261017220001-c4srcpg", "20261017220002-c4trgpg", "20261017220021-c4pivot"
++	srcPath := "/" + srcID + ".sy"
++	setup := func(t *testing.T) (f *moveCacheFixture, srcTree *parse.Tree) {
++		t.Helper()
++		f = setupMoveCacheTest(t)
++		addMoveCachePage(t, f.work, srcPath, "/Source page", "Source page")
++		addMoveCachePage(t, f.work, "/"+targetID+".sy", "/Target page", "Target page")
++		appendMoveCacheParagraph(t, targetID, pivotID, "pivot")
++
++		// The page tree and an edit read the source page: its page attributes, and the page.
++		clearOutsideCaches()
++		if ial := Conf.Box(f.work).docIAL(srcPath); "Source page" != ial["title"] {
++			t.Fatalf("setup: the source page's attributes read %v", ial)
++		}
++		var err error
++		if srcTree, err = filesys.LoadTree(f.work, srcPath, util.NewLute()); nil != err {
++			t.Fatalf("setup: load the source page failed: %v", err)
++		}
++		waitOutsideCached(t, "the page attribute cache doesn't serve the source page", func() bool {
++			return nil != cache.GetDocIALInBox(srcPath, f.work)
++		})
++		waitOutsideCached(t, "the page cache doesn't serve the source page", func() bool {
++			_, ok := cache.GetTreeDataInBox(srcID, f.work)
++			return ok
++		})
++
++		doc2HeadingChallenge(t, srcID, pivotID)
++		if _, statErr := os.Stat(filepath.Join(util.DataDir, f.work, srcPath)); !os.IsNotExist(statErr) {
++			t.Fatalf("setup: doc2Heading left the source page's file: %v", statErr)
++		}
++		return
++	}
++
++	t.Run("its page attributes", func(t *testing.T) {
++		f, _ := setup(t)
++		if ial := Conf.Box(f.work).docIAL(srcPath); nil != ial {
++			t.Errorf("after doc2Heading, the source page's attributes read %v, though its file is gone", ial)
++		}
++	})
++	t.Run("its page", func(t *testing.T) {
++		f, srcTree := setup(t)
++		if _, err := filesys.WriteTree(srcTree); nil != err {
++			t.Fatalf("save the source page as read before failed: %v", err)
++		}
++		if _, err := os.Stat(filepath.Join(util.DataDir, f.work, srcPath)); nil != err {
++			t.Errorf("after doc2Heading, a save of the source page as read before wrote no file (%v): it took the page "+
++				"cache's copy, older than the removal, for what the file holds", err)
++		}
++	})
++}
++
++// A data.zip import (/api/import/importData) copies the archive's data folder over the workspace's with filelock.Copy
++// and only queues a full reindex, which clears the caches when the task queue reaches it. Until then, on v3.8.7 and
++// step 3, every page and database SiYuan read before the import is served as it was: nothing raised them. After
++// ImportData returns, the page and the database it imported must read as the archive holds them.
++func TestDataImportServesTheImportedCopies(t *testing.T) {
++	f := setupMoveCacheTest(t)
++	page := addOutsidePage(t, f.work, "20261017220101-imppage", "old")
++	database := saveOutsideDatabase(t, "20261017220102-impdbse", "Old table")
++	pageData, err := os.ReadFile(page.absPath())
++	if nil != err {
++		t.Fatal(err)
++	}
++	databaseData, err := os.ReadFile(database.absPath())
++	if nil != err {
++		t.Fatal(err)
++	}
++
++	// data.zip holds one folder, the workspace's data folder, here with the page's and the database's new copies.
++	zipPath := filepath.Join(t.TempDir(), "data.zip")
++	file, err := os.Create(zipPath)
++	if nil != err {
++		t.Fatal(err)
++	}
++	newPage := replaceOutsideJSONString(t, pageData, "custom-v", "old", "new")
++	newDatabase := replaceOutsideJSONString(t, databaseData, "name", "Old table", "New table")
++	writer := archivezip.NewWriter(file)
++	for name, data := range map[string][]byte{
++		"data/" + f.work + page.path():                      newPage,
++		"data/storage/av/" + database.attrView.ID + ".json": newDatabase,
++	} {
++		entry, createErr := writer.Create(name)
++		if nil != createErr {
++			t.Fatal(createErr)
++		}
++		if _, err = entry.Write(data); nil != err {
++			t.Fatal(err)
++		}
++	}
++	if err = writer.Close(); nil != err {
++		t.Fatal(err)
++	}
++	if err = file.Close(); nil != err {
++		t.Fatal(err)
++	}
++
++	clearOutsideCaches(database.attrView.ID)
++	page.read(t, "old")
++	database.read(t, "Old table")
++
++	waitFullReindexRefreshed(t)
++	if err = ImportData(zipPath); nil != err {
++		t.Fatalf("import data.zip failed: %v", err)
++	}
++	page.check(t, "after the data.zip import", "new")
++	database.check(t, "after the data.zip import", "New table")
++}
++
++// A sync that downloads from the cloud (syncRepoDownload, the sync menu's "download"), here from a cloud in a local
++// folder (the local provider), which another device has published to. dejavu writes the cloud's files over the
++// workspace's, and processSyncMergeResult then drops the changed pages from the caches, but when more than a fifth of
++// the pages changed it only queues a full reindex instead, which clears the caches when the task queue reaches it.
++// Until then, on v3.8.7 and step 3, the pages SiYuan read before the sync are served as they were: nothing raised
++// them. After the sync returns, the page it downloaded must read as the cloud holds it.
++func TestSyncDownloadServesTheDownloadedPage(t *testing.T) {
++	f := setupMoveCacheTest(t)
++	page := addOutsidePage(t, f.work, "20261017220301-syncpge", "old")
++	pageData, err := os.ReadFile(page.absPath())
++	if nil != err {
++		t.Fatal(err)
++	}
++
++	base := t.TempDir()
++	remote := filepath.Join(base, "cloud")
++	if err = os.MkdirAll(remote, 0755); nil != err {
++		t.Fatal(err)
++	}
++	key := []byte("0123456789abcdef0123456789abcdef")
++	previousWorkspace, previousRepo, previousStatusBar := util.WorkspaceDir, util.RepoDir, util.StatusBarCfg.Load()
++	t.Cleanup(func() {
++		util.WorkspaceDir, util.RepoDir = previousWorkspace, previousRepo
++		util.StatusBarCfg.Store(previousStatusBar)
++	})
++	util.WorkspaceDir = filepath.Dir(util.DataDir)
++	util.RepoDir = filepath.Join(base, "repo")
++	util.StatusBarCfg.Store(&util.StatusBar{MsgDataSyncDisabled: true})
++	syncConf, repoConf, systemConf := conf.NewSync(), conf.NewRepo(), conf.NewSystem()
++	syncConf.Provider, syncConf.CloudName, syncConf.Enabled = conf.ProviderLocal, "main", true
++	syncConf.Local = &conf.Local{Endpoint: remote}
++	repoConf.Key = key
++	systemConf.ID, systemConf.Name, systemConf.OS = "kernel-device", "kernel-device", "linux"
++	Conf.Sync.Store(syncConf)
++	Conf.Repo.Store(repoConf)
++	Conf.System.Store(systemConf)
++	Conf.Search.Store(conf.NewSearch())
++
++	// The other device holds the same workspace with the page's new copy, and publishes it to the cloud. dejavu tells
++	// files apart by path and modification second, so every file but the page carries the same time on both devices.
++	if err = os.MkdirAll(filepath.Join(util.DataDir, ".siyuan"), 0755); nil != err {
++		t.Fatal(err)
++	}
++	if err = os.WriteFile(filepath.Join(util.DataDir, ".siyuan", "syncignore"), nil, 0644); nil != err {
++		t.Fatal(err)
++	}
++	otherDir := filepath.Join(base, "other")
++	otherData := filepath.Join(otherDir, "data")
++	if err = os.CopyFS(otherData, os.DirFS(util.DataDir)); nil != err {
++		t.Fatal(err)
++	}
++	otherPage := filepath.Join(otherData, f.work, page.path())
++	if err = os.WriteFile(otherPage, replaceOutsideJSONString(t, pageData, "custom-v", "old", "new"), 0644); nil != err {
++		t.Fatal(err)
++	}
++	for _, dir := range []string{util.DataDir, otherData} {
++		stampOutsideFiles(t, dir, time.Unix(1700000010, 0))
++	}
++	if err = os.Chtimes(otherPage, time.Unix(1700000020, 0), time.Unix(1700000020, 0)); nil != err {
++		t.Fatal(err)
++	}
++	backend := cloud.NewLocal(&cloud.BaseCloud{Conf: &cloud.Conf{Dir: "main", RepoPath: filepath.Join(otherDir, "repo"),
++		AvailableSize: 1 << 30, Local: &cloud.ConfLocal{Endpoint: remote}}})
++	other, err := dejavu.NewRepo(otherData, filepath.Join(otherDir, "repo"), filepath.Join(otherDir, "history"),
++		filepath.Join(otherDir, "temp"), "other-device", "other-device", "linux", key, nil, backend)
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, err = other.Index("other device", true, nil); nil != err {
++		t.Fatal(err)
++	}
++	if _, _, err = other.Sync(nil); nil != err {
++		t.Fatalf("the other device's sync failed: %v", err)
++	}
++
++	clearOutsideCaches()
++	page.read(t, "old")
++	waitFullReindexRefreshed(t)
++	if err = syncRepoDownload(); nil != err {
++		t.Fatalf("sync download failed: %v", err)
++	}
++	if upserted, trees := 1, treenode.CountTrees(); !needFullReindex(upserted) {
++		t.Fatalf("setup: one changed page of %d doesn't take the full-reindex branch", trees)
++	}
++	page.check(t, "after the sync download", "new")
++}
++
++// A full snapshot checkout (/api/repo/checkoutRepo) writes the snapshot's files over the workspace's through dejavu,
++// then hands over to its refresh, which in checkoutRepo reindexes everything. On v3.8.7 and step 3 nothing raises what
++// the checkout wrote, so until a clear reaches them, the pages and databases SiYuan read before are served as they
++// were, and a job landing then saves its copy over the snapshot's. checkoutRepoSnapshot takes the refresh as an
++// argument, as SiYuan's own checkout test uses it: right after the checkout's write, before any refresh, the page and
++// the database it restored must read as the snapshot holds them.
++func TestCheckoutServesTheSnapshotRightAfterItsWrite(t *testing.T) {
++	f := setupMoveCacheTest(t)
++	page := addOutsidePage(t, f.work, "20261017220201-snppage", "snapshot")
++	database := saveOutsideDatabase(t, "20261017220202-snpdbse", "Snapshot table")
++	stamp := func(tick int64) {
++		for _, p := range []string{page.absPath(), database.absPath()} {
++			when := time.Unix(1700000000+tick, 0)
++			if err := os.Chtimes(p, when, when); nil != err {
++				t.Fatal(err)
++			}
++		}
++	}
++	stamp(10)
++	base := t.TempDir()
++	repo, err := dejavu.NewRepo(util.DataDir, filepath.Join(base, "repo"), filepath.Join(base, "history"),
++		filepath.Join(base, "temp"), "device", "device", "linux", []byte("0123456789abcdef0123456789abcdef"), nil, nil)
++	if nil != err {
++		t.Fatal(err)
++	}
++	snapshot, err := repo.Index("snapshot", false, nil)
++	if nil != err {
++		t.Fatal(err)
++	}
++
++	page.setValue(t, "current value")
++	database.setName(t, "Current table name")
++	stamp(20)
++	clearOutsideCaches(database.attrView.ID)
++	page.read(t, "current value")
++	database.read(t, "Current table name")
++
++	refreshed := false
++	err = checkoutRepoSnapshot(repo, snapshot.ID, func(checkoutErr error) {
++		refreshed = true
++		if nil != checkoutErr {
++			t.Errorf("the checkout failed: %v", checkoutErr)
++			return
++		}
++		page.check(t, "right after the checkout's write", "snapshot")
++		database.check(t, "right after the checkout's write", "Snapshot table")
++	})
++	if nil != err || !refreshed {
++		t.Fatalf("checkout failed: %v, refreshed %v", err, refreshed)
++	}
++}
+diff --git a/kernel/model/raise_fts5_test.go b/kernel/model/raise_fts5_test.go
+new file mode 100644
+index 0000000..6c2cc54
+--- /dev/null
++++ b/kernel/model/raise_fts5_test.go
+@@ -0,0 +1,131 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// A page turned into a heading of another page (/api/filetree/doc2Heading) leaves no current copy of itself: its file
++// is removed raw (box.Remove), and the remove raises the page, so the page cache's copy of it and its page attributes
++// cached under its old path miss afterwards.
++func TestDoc2HeadingLeavesNoCurrentCopyOfItsSourcePage(t *testing.T) {
++	f := setupMoveCacheTest(t)
++	const srcID, targetID, pivotID = "20261017160001-c4srcpg", "20261017160002-c4trgpg", "20261017160021-c4pivot"
++	srcPath := "/" + srcID + ".sy"
++	addMoveCachePage(t, f.work, srcPath, "/Source doc", "Source doc")
++	addMoveCachePage(t, f.work, "/"+targetID+".sy", "/Target doc", "Target doc")
++	appendMoveCacheParagraph(t, targetID, pivotID, "pivot")
++
++	// Read the source page through the caches, so each holds a copy of it.
++	if _, err := filesys.LoadTree(f.work, srcPath, util.NewLute()); nil != err {
++		t.Fatalf("setup: load the source page failed: %v", err)
++	}
++	Conf.Box(f.work).docIAL(srcPath)
++	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
++		_, page := cache.GetTreeDataInBox(srcID, f.work)
++		doc := nil != cache.GetDocIALInBox(srcPath, f.work)
++		if page && doc {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("setup: the caches don't serve the source page: page %v, page attributes %v", page, doc)
++		}
++	}
++
++	doc2HeadingChallenge(t, srcID, pivotID)
++
++	if _, ok := cache.GetTreeDataInBox(srcID, f.work); ok {
++		t.Error("after doc2Heading, the page cache serves the source page, whose file was removed")
++	}
++	if ial := cache.GetDocIALInBox(srcPath, f.work); nil != ial {
++		t.Errorf("after doc2Heading, the page attribute cache serves the source page's attributes %v under its old path", ial)
++	}
++}
++
++// Rolling a page back to a snapshot that holds what the page holds now keeps the page's file. The rollback removes the
++// page's file raw, then writes the page from the snapshot through WriteTree, which skips the write when the page
++// cache's copy is current and holds the same bytes. The remove raises the page, so the copy isn't current and the
++// write lands.
++func TestRollingAnUnchangedPageBackToASnapshotKeepsItsFile(t *testing.T) {
++	boxID, pagePath := setupRestoreCacheTest(t)
++	originalRepoDir := util.RepoDir
++	util.RepoDir = filepath.Join(util.WorkspaceDir, "repo")
++	t.Cleanup(func() { util.RepoDir = originalRepoDir })
++	Conf.Repo.Store(&conf.Repo{Key: bytes.Repeat([]byte{7}, 32)}) // snapshots need the repository's key
++	Conf.System.Store(&conf.System{ID: "20261017160000-device1", Name: "test", OS: "linux"})
++	originalStatusBar := util.StatusBarCfg.Load()
++	util.StatusBarCfg.Store(util.NewStatusBar(false))
++	t.Cleanup(func() { util.StatusBarCfg.Store(originalStatusBar) })
++
++	snapshotID, err := IndexRepo("an unchanged page")
++	if nil != err {
++		t.Fatalf("take a snapshot failed: %v", err)
++	}
++	repo, err := newRepository()
++	if nil != err {
++		t.Fatal(err)
++	}
++	index, err := repo.GetIndex(snapshotID)
++	if nil != err {
++		t.Fatal(err)
++	}
++	fileID := ""
++	for _, id := range index.Files {
++		file, getErr := repo.GetFile(id)
++		if nil != getErr {
++			t.Fatal(getErr)
++		}
++		if "/"+boxID+pagePath == file.Path {
++			fileID = id
++		}
++	}
++	if "" == fileID {
++		t.Fatalf("setup: the snapshot holds no %s", "/"+boxID+pagePath)
++	}
++
++	// The page cache holds the page as its file does.
++	if _, err = filesys.LoadTree(boxID, pagePath, util.NewLute()); nil != err {
++		t.Fatalf("setup: load the page failed: %v", err)
++	}
++	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
++		if _, ok := cache.GetTreeDataInBox(restoreCachePageID, boxID); ok {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("setup: the page cache doesn't serve the page")
++		}
++	}
++
++	if err = RollbackRepoSnapshotFile(fileID); nil != err {
++		t.Fatalf("roll the page back to the snapshot failed: %v", err)
++	}
++	if _, statErr := os.Stat(filepath.Join(util.DataDir, boxID, pagePath)); nil != statErr {
++		t.Fatalf("after the rollback, the page's file is gone: %v", statErr)
++	}
++}
+diff --git a/kernel/model/repository.go b/kernel/model/repository.go
+index 2904510..c119e3f 100644
+--- a/kernel/model/repository.go
++++ b/kernel/model/repository.go
+@@ -59,6 +59,7 @@ import (
+ 	"github.com/siyuan-note/siyuan/kernel/bazaar"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
+ 	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/heif"
+ 	"github.com/siyuan-note/siyuan/kernel/sql"
+ 	"github.com/siyuan-note/siyuan/kernel/task"
+@@ -339,7 +340,8 @@ func RollbackRepoSnapshotFile(fileID string) (err error) {
+ 
+ 		if nil != workingDoc && "d" == workingDoc.Type {
+ 			workingDocPath := filepath.Join(util.DataDir, boxID, workingDoc.Path)
+-			if err = filelock.Remove(workingDocPath); err != nil {
++			err = removeDataPath(workingDocPath)
++			if err != nil {
+ 				return
+ 			}
+ 			logging.LogInfof("removed working doc file [%s]", workingDocPath)
+@@ -359,7 +361,10 @@ func RollbackRepoSnapshotFile(fileID string) (err error) {
+ 		util.PushMsg(msg, 7000)
+ 	} else {
+ 		to := filepath.Join(util.DataDir, file.Path)
+-		if err = filelock.CopyNewtimes(from, to); nil != err {
++		err = filelock.CopyNewtimes(from, to)
++		// Raised whether or not the copy finished: a failed copy may have truncated the file.
++		filesys.RaiseForDataPath(to)
++		if nil != err {
+ 			logging.LogErrorf("copy file [%s] to [%s] failed: %s", from, to, err)
+ 			return
+ 		}
+@@ -1494,6 +1499,11 @@ func checkoutRepo(id string) (err error) {
+ // checkoutRepoSnapshot 恢复失败前可能已有文件落盘，返回结果前同步更新索引、缓存和界面。
+ func checkoutRepoSnapshot(repo *dejavu.Repo, id string, refresh func(error)) error {
+ 	upserts, removes, err := repo.Checkout(id, map[string]any{eventbus.CtxPushMsg: eventbus.CtxPushMsgToStatusBarAndProgress})
++	if nil != err {
++		// Each file the checkout wrote or removed raised as it did (raiseAfterCheckoutFile); a write that failed part way
++		// may have sent no event.
++		cache.RaiseAll()
++	}
+ 	themes, icons := appearanceChangedPackages(&dejavu.MergeResult{Upserts: upserts, Removes: removes})
+ 	refreshAppearancePackages(themes, icons)
+ 	refresh(err)
+@@ -1995,6 +2005,28 @@ func pushSyncStatusBar(msg string) {
+ 	util.PushStatusBar(msg)
+ }
+ 
++// ctxCheckoutAssetsOnly marks the context of a dejavu call that checks out assets only (/assets/ paths), so its file
++// events raise nothing: no cache holds an asset.
++const ctxCheckoutAssetsOnly = "siyuanCheckoutAssetsOnly"
++
++// newAssetSyncContext is newSyncContext for a call that downloads assets only.
++func newAssetSyncContext() map[string]any {
++	ret := newSyncContext()
++	ret[ctxCheckoutAssetsOnly] = true
++	return ret
++}
++
++// raiseAfterCheckoutFile raises what dejavu wrote or removed in the data folder, after each file, as a sync, a
++// checkout or an asset recovery writes it. dejavu's events name no file (they carry the context, a count and a total),
++// so the raise can't be by path: it raises every page and database. A raise is a version bump, so many in a row cost
++// what one costs, but for the reads made between them, which miss.
++func raiseAfterCheckoutFile(context map[string]any) {
++	if assetsOnly, _ := context[ctxCheckoutAssetsOnly].(bool); assetsOnly {
++		return
++	}
++	cache.RaiseAll()
++}
++
+ func newSyncContext() map[string]any {
+ 	pushTarget := eventbus.CtxPushMsgToStatusBar
+ 	if syncStatusBarDisabled() {
+@@ -2060,6 +2092,7 @@ func syncRepoDownload() (err error) {
+ 	syncContext := newSyncContext()
+ 	cloudStart := time.Now()
+ 	mergeResult, trafficStat, err := repo.SyncDownload(syncContext)
++	raiseAfterSync(mergeResult, err)
+ 	cloudElapsed := time.Since(cloudStart)
+ 	elapsed := time.Since(start)
+ 	if err != nil {
+@@ -3205,6 +3238,7 @@ func subscribeRepoEvents() {
+ 	})
+ 	coUpsertFileCount := 0
+ 	eventbus.Subscribe(eventbus.EvtCheckoutUpsertFile, func(context map[string]any, count, total int) {
++		raiseAfterCheckoutFile(context)
+ 		msg := fmt.Sprintf(Conf.Language(162), count, total)
+ 		util.IncBootProgress(bootProgressPart, msg)
+ 		if 0 == coUpsertFileCount%32 {
+@@ -3220,6 +3254,7 @@ func subscribeRepoEvents() {
+ 	})
+ 
+ 	eventbus.Subscribe(eventbus.EvtCheckoutRemoveFile, func(context map[string]any, count, total int) {
++		raiseAfterCheckoutFile(context)
+ 		msg := fmt.Sprintf(Conf.Language(163), count, total)
+ 		util.IncBootProgress(bootProgressPart, msg)
+ 		if 0 == count%64 {
+diff --git a/kernel/model/sync_perception.go b/kernel/model/sync_perception.go
+index 6cc12e4..6293a73 100644
+--- a/kernel/model/sync_perception.go
++++ b/kernel/model/sync_perception.go
+@@ -10,7 +10,9 @@ import (
+ 	"github.com/siyuan-note/dejavu"
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
++	"github.com/siyuan-note/siyuan/kernel/cache"
+ 	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+ 
+@@ -27,9 +29,30 @@ func syncRepoWithPublication(repo *dejavu.Repo, context map[string]any) (*dejavu
+ 	uploadingRef := &atomic.Bool{}
+ 	context[syncCloudRefContextKey] = uploadingRef
+ 	mergeResult, trafficStat, err := repo.Sync(context)
++	raiseAfterSync(mergeResult, err)
+ 	return mergeResult, trafficStat, nil == err && uploadingRef.Load(), err
+ }
+ 
++// raiseAfterSync raises, once a sync or an asset recovery returns, what its file events didn't. Each file dejavu
++// writes, and each it removes through its own removes, raises as it goes (raiseAfterCheckoutFile). An asset recovery,
++// which a sync with dejavu's asset downloads on runs to apply its merge, removes the merge's removed files with no
++// event, so they are raised here, by path. A failure may have written part of a file with no event, so it raises
++// everything.
++func raiseAfterSync(mergeResult *dejavu.MergeResult, err error) {
++	if nil != err {
++		cache.RaiseAll()
++		return
++	}
++	if nil == mergeResult {
++		return
++	}
++	removed := make([]string, 0, len(mergeResult.Removes))
++	for _, file := range mergeResult.Removes {
++		removed = append(removed, filepath.Join(util.DataDir, file.Path))
++	}
++	filesys.RaiseForDataPath(removed...)
++}
++
+ // syncCloudAlreadyApplied 使用持久化同步点识别延迟通知，保留此后尚未上传的本地修改。
+ func syncCloudAlreadyApplied(repoPath, latestID string) (bool, error) {
+ 	if "" == latestID {
+diff --git a/kernel/server/serve.go b/kernel/server/serve.go
+index c06380b..2e196c5 100644
+--- a/kernel/server/serve.go
++++ b/kernel/server/serve.go
+@@ -46,6 +46,7 @@ import (
+ 	"github.com/siyuan-note/siyuan/kernel/api"
+ 	"github.com/siyuan-note/siyuan/kernel/av"
+ 	"github.com/siyuan-note/siyuan/kernel/cmd"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
+ 	"github.com/siyuan-note/siyuan/kernel/heif"
+ 	"github.com/siyuan-note/siyuan/kernel/mcp"
+ 	mcpclient "github.com/siyuan-note/siyuan/kernel/mcp/client"
+@@ -2050,13 +2051,20 @@ func (fs *encryptedBoxAwareWebdavFS) OpenFile(ctx context.Context, name string,
+ 	if fs.isEncryptedBoxPath(name) {
+ 		return nil, os.ErrPermission
+ 	}
+-	return fs.inner.OpenFile(ctx, name, flag, perm)
++	f, err := fs.inner.OpenFile(ctx, name, flag, perm)
++	if nil != err || 0 == flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_APPEND) {
++		return f, err
++	}
++	return &raisingWebdavFile{File: f, absPath: webdavAbsPath(name)}, nil
+ }
+ 
+ func (fs *encryptedBoxAwareWebdavFS) RemoveAll(ctx context.Context, name string) error {
+ 	if fs.isEncryptedBoxPath(name) {
+ 		return os.ErrPermission
+ 	}
++	// WebDAV writes bypass WriteTree and saveAttributeView: raise the pages and databases the remove takes away.
++	endWrite := filesys.BeginDataPathWrite(webdavAbsPath(name))
++	defer endWrite()
+ 	return fs.inner.RemoveAll(ctx, name)
+ }
+ 
+@@ -2064,7 +2072,27 @@ func (fs *encryptedBoxAwareWebdavFS) Rename(ctx context.Context, oldName, newNam
+ 	if fs.isEncryptedBoxPath(oldName) || fs.isEncryptedBoxPath(newName) {
+ 		return os.ErrPermission
+ 	}
+-	return fs.inner.Rename(ctx, oldName, newName)
++	err := fs.inner.Rename(ctx, oldName, newName)
++	filesys.RaiseForDataPath(webdavAbsPath(oldName), webdavAbsPath(newName))
++	return err
++}
++
++// webdavAbsPath is where webdav.Dir(util.WorkspaceDir) puts name.
++func webdavAbsPath(name string) string {
++	return filepath.Join(util.WorkspaceDir, filepath.FromSlash(path.Clean("/"+name)))
++}
++
++// raisingWebdavFile is a file WebDAV opened for writing. A PUT or a COPY writes it before closing it, so its close
++// raises the page or database it may be.
++type raisingWebdavFile struct {
++	webdav.File
++	absPath string
++}
++
++func (f *raisingWebdavFile) Close() error {
++	err := f.File.Close()
++	filesys.RaiseForDataPath(f.absPath)
++	return err
+ }
+ 
+ func (fs *encryptedBoxAwareWebdavFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+-- 
+2.53.0
+

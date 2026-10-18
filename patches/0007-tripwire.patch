@@ -1,0 +1,2449 @@
+From 0e7f57485e4fdb8b60a46f9375b4040a3e055dd7 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 12:04:59 -0400
+Subject: [PATCH] A save outside a job's turn logs where it came from
+
+SiYuan's jobs read, change and save pages and databases while they hold
+flushLock, one at a time. Other writers save without it, so one can
+save a copy it read before a job's save over that save, and nothing
+says which writers do. This logs them, so they can join the line one at
+a time.
+
+- flushLock is a turnLock: the same mutex, whose holders count as a
+  turn through an atomic count. Every holder counts, the queue's jobs,
+  PerformTxSync, the commit and the writers that already take the lock;
+  the flusher's tick on an empty queue takes the bare mutex and isn't a
+  turn.
+- filesys.WriteTree, WriteTreeIfUnchanged and av.saveAttributeView call
+  the new kernel/tripwire package before they write. Inside a turn that
+  costs one atomic load, with no stack walk and no allocation.
+- Outside a turn, a save logs one warning per call site and process:
+  "tripwire: save outside a turn: <page|database> <pkg.Func>
+  <file>:<line> <- <its caller>", and each further caller of a logged
+  site once, as "tripwire: another caller of a save outside a turn:
+  ...". The site is the first frame outside the save functions and the
+  thin wrappers that only forward to them, avSaveView among them; a go
+  statement that calls a save function directly is named by that
+  function. The set of sites is capped at 4,096, and the line saying so
+  carries the marker.
+- Not logged: the first save of a new page or database (no file, and,
+  for a page, no index entry placing it elsewhere, so a stale save to a
+  moved page's old path logs), the missing-parent rebuild, and
+  fixTreeJSONData's write-back, which doesn't go through WriteTree.
+
+It is a guide, not a proof: a save that lands during another
+goroutine's turn, a writer that reads before its turn and saves inside
+it, raw writes around the save functions, and the CLI in its own
+process aren't seen. It is always on.
+
+The patch carries 28 Go tests: the test writer's 6, which read the log
+in a process of their own each and fail without it; the builder's, of
+the turn count, the once-per-site set, the empty tick and two callers
+of one helper; and the challenger's, of a writer behind avSaveView, a
+save to a path its page has left and a go statement.
+---
+ kernel/av/av.go                              |   7 +
+ kernel/av/tripwire_sites_test.go             |  70 ++
+ kernel/filesys/tree.go                       |  29 +-
+ kernel/filesys/tree_compare_write.go         |   2 +
+ kernel/filesys/tripwire_sites_test.go        | 130 ++++
+ kernel/model/asset_relink_batch.go           |   4 +-
+ kernel/model/transaction.go                  |  47 +-
+ kernel/model/tripwire_challenge_fts5_test.go | 372 ++++++++++
+ kernel/model/tripwire_fts5_test.go           | 687 +++++++++++++++++++
+ kernel/model/tripwire_turn_fts5_test.go      | 103 +++
+ kernel/tripwire/challenge_test.go            |  68 ++
+ kernel/tripwire/tripwire.go                  | 286 ++++++++
+ kernel/tripwire/tripwire_test.go             | 389 +++++++++++
+ 13 files changed, 2186 insertions(+), 8 deletions(-)
+ create mode 100644 kernel/av/tripwire_sites_test.go
+ create mode 100644 kernel/filesys/tripwire_sites_test.go
+ create mode 100644 kernel/model/tripwire_challenge_fts5_test.go
+ create mode 100644 kernel/model/tripwire_fts5_test.go
+ create mode 100644 kernel/model/tripwire_turn_fts5_test.go
+ create mode 100644 kernel/tripwire/challenge_test.go
+ create mode 100644 kernel/tripwire/tripwire.go
+ create mode 100644 kernel/tripwire/tripwire_test.go
+
+diff --git a/kernel/av/av.go b/kernel/av/av.go
+index 905052f..8da498d 100644
+--- a/kernel/av/av.go
++++ b/kernel/av/av.go
+@@ -35,10 +35,16 @@ import (
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ 	"golang.org/x/sync/singleflight"
+ )
+ 
++func init() {
++	// A database save outside a turn is named at the caller of these.
++	tripwire.SaveFunctions(SaveAttributeView, SaveAttributeViewIfUnchanged, saveAttributeView)
++}
++
+ // AttributeView 描述了属性视图的结构。
+ type AttributeView struct {
+ 	Spec              int                `json:"spec"`                        // 格式版本
+@@ -1134,6 +1140,7 @@ func saveAttributeView(av *AttributeView, original []byte) (err error) {
+ 		// 加密笔记本的首次创建由 handler 层通过 SetAVBoxID 预设路径
+ 		avJSONPath = GetAttributeViewDataPath(av.ID)
+ 	}
++	tripwire.Save(tripwire.Database, avJSONPath)
+ 	if original != nil {
+ 		if avBoxID != "" {
+ 			return errors.New("conditional replacement of encrypted attribute views is not supported")
+diff --git a/kernel/av/tripwire_sites_test.go b/kernel/av/tripwire_sites_test.go
+new file mode 100644
+index 0000000..e593d66
+--- /dev/null
++++ b/kernel/av/tripwire_sites_test.go
+@@ -0,0 +1,70 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++package av
++
++import (
++	"fmt"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// siteOfSaveOnNextLine returns how the tripwire names a save made on the line after its caller's.
++func siteOfSaveOnNextLine() string {
++	pcs := make([]uintptr, 1)
++	runtime.Callers(2, pcs)
++	frame, _ := runtime.CallersFrames(pcs).Next()
++	name := frame.Function[strings.LastIndexByte(frame.Function, '/')+1:]
++	return fmt.Sprintf("%s %s:%d", name, filepath.Base(frame.File), frame.Line+1)
++}
++
++func TestTripwireLogsADatabaseSaveOutsideATurnAtItsWriter(t *testing.T) {
++	const avID = "20261018000000-tripwav"
++	originalDataDir := util.DataDir
++	util.DataDir = t.TempDir()
++	t.Cleanup(func() {
++		cache.RemoveAVData(avID)
++		util.DataDir = originalDataDir
++	})
++	attrView := &AttributeView{ID: avID, Spec: RichTextSpec, Name: "Original",
++		KeyValues: []*KeyValues{{Key: &Key{ID: "20261018000000-blockky", Name: "Name", Type: KeyTypeBlock}}},
++		Views: []*View{{ID: "20261018000000-tablevw", Name: "Table", LayoutType: LayoutTypeTable, Table: NewLayoutTable(),
++			PageSize: ViewDefaultPageSize}},
++		RenderedViewables: map[string]Viewable{}}
++
++	firstSave := siteOfSaveOnNextLine()
++	if err := SaveAttributeView(attrView); nil != err {
++		t.Fatal(err)
++	}
++	if _, ok := tripwire.Sites()[firstSave]; ok {
++		t.Fatal("the first save of a brand-new database was logged")
++	}
++
++	attrView.Name = "Edited"
++	save := siteOfSaveOnNextLine()
++	if err := SaveAttributeView(attrView); nil != err {
++		t.Fatal(err)
++	}
++	if kind, ok := tripwire.Sites()[save]; !ok || tripwire.Database != kind {
++		t.Fatalf("a save of an existing database outside a turn wasn't logged at %q: %v", save, tripwire.Sites())
++	}
++
++	tripwire.EnterTurn()
++	attrView.Name = "Edited in a turn"
++	inTurn := siteOfSaveOnNextLine()
++	err := SaveAttributeView(attrView)
++	tripwire.LeaveTurn()
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, ok := tripwire.Sites()[inTurn]; ok {
++		t.Fatal("a save inside a turn was logged")
++	}
++}
+diff --git a/kernel/filesys/tree.go b/kernel/filesys/tree.go
+index de5e7f7..0230833 100644
+--- a/kernel/filesys/tree.go
++++ b/kernel/filesys/tree.go
+@@ -42,9 +42,15 @@ import (
+ 	"github.com/siyuan-note/logging"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+ 
++func init() {
++	// A page save outside a turn is named at the caller of these.
++	tripwire.SaveFunctions(WriteTree, WriteTreeWithVersion, writeTree, WriteTreeIfUnchanged)
++}
++
+ func LoadTrees(ids []string) (ret map[string]*parse.Tree) {
+ 	ret = map[string]*parse.Tree{}
+ 	if 1 > len(ids) {
+@@ -329,7 +335,9 @@ func LoadTreeByData(data []byte, boxID, p string, luteEngine *lute.Lute) (ret *p
+ 			}
+ 			// 子文档缺失父文档时自动补全 https://github.com/siyuan-note/siyuan/issues/7376
+ 			parentTree := treenode.NewTree(boxID, parentPath, hPathBuilder.String()+"Untitled", "Untitled")
+-			if _, writeErr := WriteTree(parentTree); nil != writeErr {
++			// A repair made while loading, which can't take the turn, since loads run inside jobs too: the tripwire
++			// passes it over.
++			if _, _, writeErr := writeTree(parentTree, false); nil != writeErr {
+ 				logging.LogErrorf("rebuild parent tree [%s] failed: %s", parentAbsPath, writeErr)
+ 				return nil, writeErr
+ 			} else {
+@@ -520,10 +528,19 @@ func WriteTree(tree *parse.Tree) (size uint64, err error) {
+ // the write carries it. It returns 0 when nothing may be cached from the write: the file already held the tree, so it
+ // wrote nothing, or another write of the page overlapped it (EndTreeWrite).
+ func WriteTreeWithVersion(tree *parse.Tree) (size uint64, version cache.FillToken, err error) {
++	return writeTree(tree, true)
++}
++
++// writeTree is WriteTreeWithVersion. With tripwireOn false the tripwire doesn't check the save, as for the
++// missing-parent rebuild, a repair made while loading.
++func writeTree(tree *parse.Tree, tripwireOn bool) (size uint64, version cache.FillToken, err error) {
+ 	data, filePath, err := prepareWriteTree(tree)
+ 	if err != nil {
+ 		return
+ 	}
++	if tripwireOn {
++		tripwire.SaveMovable(tripwire.Page, filePath, func() bool { return pageMovedAway(tree) })
++	}
+ 
+ 	dek, encrypted, releaseCryptoLease, leaseErr := acquireCryptoLease(tree.Box)
+ 	if leaseErr != nil {
+@@ -590,6 +607,14 @@ func WriteTreeWithVersion(tree *parse.Tree) (size uint64, version cache.FillToke
+ 	return
+ }
+ 
++// pageMovedAway reports whether the block index places page tree at another path than tree's, as after a move: a save
++// to tree's path, where no file is, then puts a second copy of the page back where it was, and isn't a new page's first
++// save. The tripwire asks only outside a turn, and only when tree's path has no file.
++func pageMovedAway(tree *parse.Tree) bool {
++	bt := treenode.GetBlockTree(tree.ID)
++	return nil != bt && (bt.BoxID != tree.Box || bt.Path != tree.Path)
++}
++
+ // writeTreeBracketed runs write, a write of page rootID's file, between BeginTreeWrite and EndTreeWrite. It returns the
+ // version EndTreeWrite returned, which is 0 when the write failed or when something else raised the page during it;
+ // then the caller caches nothing. The end runs even if write panics, and always before the caller's stores.
+@@ -809,6 +834,8 @@ func fixTreeJSONData(boxID, p string, jsonData, original []byte, luteEngine *lut
+ 		err = encErr
+ 		return
+ 	}
++	// A repair made while loading, which can't take the turn, since loads run inside jobs too: it writes without
++	// WriteTree, so the tripwire never sees it.
+ 	version, err = writeTreeBracketed(ret.ID, func() error {
+ 		return util.WriteFileIfUnchanged(filePath, original, encData)
+ 	})
+diff --git a/kernel/filesys/tree_compare_write.go b/kernel/filesys/tree_compare_write.go
+index 6e9ac40..5b9ec09 100644
+--- a/kernel/filesys/tree_compare_write.go
++++ b/kernel/filesys/tree_compare_write.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/88250/lute/parse"
+ 	"github.com/siyuan-note/filelock"
+ 	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+ 
+@@ -31,6 +32,7 @@ func WriteTreeIfUnchanged(tree *parse.Tree, original []byte) (uint64, error) {
+ 	if err != nil {
+ 		return 0, err
+ 	}
++	tripwire.SaveMovable(tripwire.Page, filePath, func() bool { return pageMovedAway(tree) })
+ 	diskData, err := encryptDataWithDEK(tree.Box, tree.Path, data, dek)
+ 	if err != nil {
+ 		return 0, err
+diff --git a/kernel/filesys/tripwire_sites_test.go b/kernel/filesys/tripwire_sites_test.go
+new file mode 100644
+index 0000000..61a3677
+--- /dev/null
++++ b/kernel/filesys/tripwire_sites_test.go
+@@ -0,0 +1,130 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++package filesys
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++
++	"github.com/88250/lute/render"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++func setupTripwireSitesTest(t *testing.T) string {
++	t.Helper()
++	original := util.DataDir
++	util.DataDir = t.TempDir()
++	cache.ClearTreeCache()
++	t.Cleanup(func() {
++		cache.ClearTreeCache()
++		util.DataDir = original
++	})
++	return "20261018000000-box0001"
++}
++
++// siteOfSaveOnNextLine returns how the tripwire names a save made on the line after its caller's.
++func siteOfSaveOnNextLine() string {
++	pcs := make([]uintptr, 1)
++	runtime.Callers(2, pcs)
++	frame, _ := runtime.CallersFrames(pcs).Next()
++	name := frame.Function[strings.LastIndexByte(frame.Function, '/')+1:]
++	return fmt.Sprintf("%s %s:%d", name, filepath.Base(frame.File), frame.Line+1)
++}
++
++// requireNoTripwireSiteIn fails if the tripwire logged a site in function.
++func requireNoTripwireSiteIn(t *testing.T, function string) {
++	t.Helper()
++	for site := range tripwire.Sites() {
++		if strings.HasPrefix(site, function+" ") {
++			t.Fatalf("the tripwire logged %q", site)
++		}
++	}
++}
++
++func TestTripwireLogsAPageSaveOutsideATurnAtItsWriter(t *testing.T) {
++	box := setupTripwireSitesTest(t)
++	tree := treenode.NewTree(box, "/20261018000001-page001.sy", "/Page", "Page")
++
++	firstSave := siteOfSaveOnNextLine()
++	if _, err := WriteTree(tree); nil != err {
++		t.Fatal(err)
++	}
++	if _, ok := tripwire.Sites()[firstSave]; ok {
++		t.Fatal("the first save of a brand-new page was logged")
++	}
++
++	tree.Root.SetIALAttr("title", "Edited")
++	save := siteOfSaveOnNextLine()
++	if _, err := WriteTree(tree); nil != err {
++		t.Fatal(err)
++	}
++	if kind, ok := tripwire.Sites()[save]; !ok || tripwire.Page != kind {
++		t.Fatalf("a save of an existing page outside a turn wasn't logged at %q: %v", save, tripwire.Sites())
++	}
++
++	snapshot, original, err := LoadTreeSnapshot(box, tree.Path, util.NewLute())
++	if nil != err {
++		t.Fatal(err)
++	}
++	snapshot.Root.SetIALAttr("title", "Edited again")
++	conditional := siteOfSaveOnNextLine()
++	if _, err = WriteTreeIfUnchanged(snapshot, original); nil != err {
++		t.Fatal(err)
++	}
++	if kind, ok := tripwire.Sites()[conditional]; !ok || tripwire.Page != kind {
++		t.Fatalf("a compare-and-swap save outside a turn wasn't logged at %q: %v", conditional, tripwire.Sites())
++	}
++
++	tripwire.EnterTurn()
++	inTurn := siteOfSaveOnNextLine()
++	_, err = WriteTree(tree)
++	tripwire.LeaveTurn()
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, ok := tripwire.Sites()[inTurn]; ok {
++		t.Fatal("a save inside a turn was logged")
++	}
++}
++
++func TestTripwirePassesOverRepairsMadeWhileLoading(t *testing.T) {
++	box := setupTripwireSitesTest(t)
++	luteEngine := util.NewLute()
++
++	// The missing-parent rebuild: a child page whose parent page is missing rebuilds the parent on load.
++	child := treenode.NewTree(box, "/20261018000002-parent1/20261018000003-child01.sy", "/Parent/Child", "Child")
++	writeStalePathFixture(t, box, child.Path, render.NewJSONRenderer(child, luteEngine.RenderOptions, luteEngine.ParseOptions).Render())
++	if _, err := LoadTree(box, child.Path, luteEngine); nil != err {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(util.DataDir, box, "20261018000002-parent1.sy")); nil != err {
++		t.Fatalf("the load didn't rebuild the missing parent: %s", err)
++	}
++
++	// fixTreeJSONData's write-back: a page whose root id differs from its file's name is repaired and written back.
++	misnamed := treenode.NewTree(box, "/20261018000004-page002.sy", "/Misnamed", "Misnamed")
++	misnamed.Root.ID = "20261018000005-other01"
++	misnamed.Root.SetIALAttr("id", misnamed.Root.ID)
++	abs := writeStalePathFixture(t, box, misnamed.Path, render.NewJSONRenderer(misnamed, luteEngine.RenderOptions, luteEngine.ParseOptions).Render())
++	before, _ := os.ReadFile(abs)
++	if _, err := LoadTree(box, misnamed.Path, luteEngine); nil != err {
++		t.Fatal(err)
++	}
++	if after, _ := os.ReadFile(abs); string(before) == string(after) {
++		t.Fatal("the load didn't write the repaired page back")
++	}
++
++	requireNoTripwireSiteIn(t, "filesys.LoadTreeByData")
++	requireNoTripwireSiteIn(t, "filesys.LoadTreeWithFix")
++	requireNoTripwireSiteIn(t, "filesys.fixTreeJSONData")
++	requireNoTripwireSiteIn(t, "filesys.TestTripwirePassesOverRepairsMadeWhileLoading")
++}
+diff --git a/kernel/model/asset_relink_batch.go b/kernel/model/asset_relink_batch.go
+index a346b32..0cc1ab8 100644
+--- a/kernel/model/asset_relink_batch.go
++++ b/kernel/model/asset_relink_batch.go
+@@ -12,7 +12,6 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 
+ 	"github.com/88250/gulu"
+@@ -127,7 +126,8 @@ func runAssetRelinks(ctx context.Context, mappings []apicontract.AssetRelinkMapp
+ 	return p.response(err)
+ }
+ 
+-func lockAssetRelink(ctx context.Context, lock *sync.Mutex) error {
++// lockAssetRelink takes lock, syncLock or flushLock, polling until it is free or ctx is done.
++func lockAssetRelink(ctx context.Context, lock interface{ TryLock() bool }) error {
+ 	ticker := time.NewTicker(10 * time.Millisecond)
+ 	defer ticker.Stop()
+ 	for {
+diff --git a/kernel/model/transaction.go b/kernel/model/transaction.go
+index 1308846..3083cbb 100644
+--- a/kernel/model/transaction.go
++++ b/kernel/model/transaction.go
+@@ -43,6 +43,7 @@ import (
+ 	"github.com/siyuan-note/siyuan/kernel/sql"
+ 	"github.com/siyuan-note/siyuan/kernel/task"
+ 	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
+ 	"github.com/siyuan-note/siyuan/kernel/util"
+ )
+ 
+@@ -110,26 +111,62 @@ func performTxSyncLocked(tx *Transaction) (err error) {
+ var (
+ 	txQueue     []*Transaction
+ 	txQueueLock sync.Mutex
+-	flushLock   sync.Mutex
++	flushLock   turnLock
+ 	isFlushing  atomic.Bool
+ )
+ 
++// turnLock is flushLock's type: a mutex whose holder has the turn. A job holds it while it runs, and so does every
++// writer that takes turns with jobs. Holding it is what the tripwire reads as being in a turn: a page or database save
++// made while no one holds it is logged once per call site.
++type turnLock struct {
++	mu sync.Mutex
++}
++
++func (l *turnLock) Lock() {
++	l.mu.Lock()
++	tripwire.EnterTurn()
++}
++
++func (l *turnLock) TryLock() bool {
++	if !l.mu.TryLock() {
++		return false
++	}
++	tripwire.EnterTurn()
++	return true
++}
++
++func (l *turnLock) Unlock() {
++	tripwire.LeaveTurn()
++	l.mu.Unlock()
++}
++
+ func init() {
+ 	go flushQueue()
++
++	// These only forward to a page or database save function; a save outside a turn is named at their caller.
++	tripwire.SaveFunctions(writeTreeUpsertQueue, writeTreeUpsertQueue0, indexWriteTreeIndexQueue,
++		indexWriteTreeUpsertQueue, indexWriteTreeUpsertQueue0, renameWriteJSONQueue, writeRenameDoc,
++		writeRenameDocIfUnchanged, writeRenameDocWith, restoreCreatedDocTreeSnapshot, avSaveView)
+ }
+ 
+ func flushQueue() {
+ 	ticker := time.NewTicker(50 * time.Millisecond)
+ 	defer ticker.Stop()
+ 	for range ticker.C {
+-		flushLock.Lock()
++		// The tick takes flushLock's mutex without the turn, and enters the turn only when it has jobs to run: an empty
++		// tick runs nothing and saves nothing, and taking it for a turn would hide a save outside a turn landing in it.
++		flushLock.mu.Lock()
+ 		isFlushing.Store(true)
+ 		transactions := takeQueuedTransactions()
+-		for _, tx := range transactions {
+-			flushTx(tx)
++		if 0 < len(transactions) {
++			tripwire.EnterTurn()
++			for _, tx := range transactions {
++				flushTx(tx)
++			}
++			tripwire.LeaveTurn()
+ 		}
+ 		isFlushing.Store(false)
+-		flushLock.Unlock()
++		flushLock.mu.Unlock()
+ 	}
+ }
+ 
+diff --git a/kernel/model/tripwire_challenge_fts5_test.go b/kernel/model/tripwire_challenge_fts5_test.go
+new file mode 100644
+index 0000000..1763c62
+--- /dev/null
++++ b/kernel/model/tripwire_challenge_fts5_test.go
+@@ -0,0 +1,372 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++//go:build fts5
++
++package model
++
++// The challenger's tests of the tripwire (issue #43, step 5). The tests named TestTripwireChallenge... are findings:
++// each fails on the builder's head, 71de88f. The tests named TestTripwireProbe... record what was checked and found
++// sound: they pass there, and are kept so the checks can be run again (under -race, and with inlining off).
++//
++// They reuse the test writer's harness in tripwire_fts5_test.go: each runs in a process of its own (runTripwireTest),
++// with SiYuan's log pointed at a file of its own (newTripwireLog).
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"slices"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// Finding: two writers that save a database outside a turn through avSaveView must each be named, since the list is
++// grouped by writer. avSaveView is a thin wrapper around av.SaveAttributeView that about 28 writers save databases
++// through (the agent's view operations, SetAttrViewFilters, SetAttrViewSorts, cell edits outside jobs, ...), but it
++// isn't among the save functions the tripwire passes over. So the first of those writers to save outside a turn is
++// logged as "model.avSaveView attribute_view.go:5643", and every other writer behind it is never logged at all.
++func TestTripwireChallengeNamesEachWriterBehindAvSaveView(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		fixture, _, _, _ := setupAttributeViewItemsTest(t, false)
++		setAttributeViewListTestLangs()
++		created, err := CreateAttributeViewDatabase(fixture.sourceID, "", "", "Challenge database", "Task",
++			av.LayoutTypeTable, []*AttributeViewCreateKey{{Name: "Status", Type: "text"}})
++		if nil != err {
++			t.Fatal(err)
++		}
++		avID, blockID, viewID := created.AvID, created.BlockID, created.ViewID
++		var textKeyID string
++		for _, kv := range created.AttributeView.KeyValues {
++			if av.KeyTypeText == kv.Key.Type {
++				textKeyID = kv.Key.ID
++			}
++		}
++		if "" == textKeyID {
++			t.Fatal("setup: the database has no text field")
++		}
++		avPath := av.GetAttributeViewDataPath(avID)
++		// Nothing may hold the turn when the writers save: no job, no background refresh.
++		FlushTxQueue()
++		backgroundRefreshWaitGroup.Wait()
++		log := newTripwireLog(t)
++		begin := log.mark(t)
++
++		_, view, err := GetAttributeViewViewTarget(avID, blockID, viewID)
++		if nil != err {
++			t.Fatal(err)
++		}
++		filters := []*av.ViewFilter{{Combination: av.FilterCombinationAnd, Filters: []*av.ViewFilter{{
++			Column: textKeyID, Operator: av.FilterOperatorContains,
++			Value: &av.Value{Type: av.KeyTypeText, Text: &av.ValueText{Content: "challenge-filter"}},
++		}}}}
++		if err = SetAttributeViewViewFilters(avID, blockID, viewID, AttributeViewViewConfigRevision(view), filters); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the filters' save", avPath, "challenge-filter")
++
++		backgroundRefreshWaitGroup.Wait()
++		_, view, err = GetAttributeViewViewTarget(avID, blockID, viewID)
++		if nil != err {
++			t.Fatal(err)
++		}
++		sorts := []*av.ViewSort{{Column: textKeyID, Order: av.SortOrderDesc}}
++		if err = SetAttributeViewViewSorts(avID, blockID, viewID, AttributeViewViewConfigRevision(view), sorts); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the sorts' save", avPath, string(av.SortOrderDesc))
++
++		lines := log.linesSince(t, begin)
++		for _, writer := range []string{"SetAttributeViewViewFilters", "SetAttributeViewViewSorts"} {
++			site := regexp.MustCompile(`\bdatabase model\.` + writer + ` (?:\S*[/\\])?attribute_view_agent\.go:\d+\b`)
++			var named []string
++			for _, line := range lines {
++				if site.MatchString(line) {
++					named = append(named, line)
++				}
++			}
++			if 1 != len(named) {
++				t.Errorf("the tripwire logged %d lines naming the writer model.%s, want 1; its lines since the writers "+
++					"began: %q", len(named), writer, lines)
++			}
++		}
++	})
++}
++
++// Finding: a writer that loaded a page saves it after the page has moved (here under another page, through MoveDocs).
++// Its save writes the page's old path, where no file is any more, so the tripwire takes it for the first save of a
++// brand-new page and logs nothing. The page isn't new: the block index has it at its new path, and the save puts a
++// second copy of it back at the old one. The same holds for a database whose file was removed under a writer.
++func TestTripwireChallengeLogsASaveToAPathItsPageHasLeft(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupStructureTransactionTest(t)
++		setupFoldTransactionDatabase(t, files)
++		stale := loadTripwirePage(t, files.box.ID, files.sourcePath) // the writer's copy, loaded before the move
++		if err := MoveDocs([]string{files.sourcePath}, files.box.ID, files.targetPath, nil); nil != err {
++			t.Fatal(err)
++		}
++		FlushTxQueue()
++		backgroundRefreshWaitGroup.Wait()
++		oldPath := tripwirePagePath(stale)
++		if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
++			t.Fatalf("setup: the move left the page's file at its old path: %v", err)
++		}
++		bt := treenode.GetBlockTree(stale.ID)
++		if nil == bt || files.sourcePath == bt.Path {
++			t.Fatalf("setup: the block index doesn't have the page at a new path: %+v", bt)
++		}
++		if _, err := os.Stat(filepath.Join(util.DataDir, bt.BoxID, bt.Path)); nil != err {
++			t.Fatalf("setup: the moved page has no file at its new path: %v", err)
++		}
++		log := newTripwireLog(t)
++		begin := log.mark(t)
++
++		stale.Root.SetIALAttr("custom-tripwire-stale", "saved")
++		site, err := tripwireChallengeSaveStalePage(stale)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the stale save", oldPath, "custom-tripwire-stale")
++		checkTripwireSite(t, "after a save, outside a turn, of a moved page at the path it left",
++			log.linesSince(t, begin), site, "page", 1)
++	})
++}
++
++//go:noinline
++func tripwireChallengeSaveStalePage(tree *parse.Tree) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTree(tree)
++	return site, err
++}
++
++// Finding: a go statement that calls a save function or one of model's wrappers directly, as "go
++// writeTreeUpsertQueue(tree)" would, is named "runtime.goexit asm_amd64.s:1771". Go elides the function it makes for
++// the statement (F.gowrap1) from the frames runtime.CallersFrames gives, so the walk passes over the wrapper and reaches
++// only the goroutine's start: every such statement in the kernel would share that one site, which names no writer.
++// callSite's rule for "gowrap" never sees one. No kernel code saves this way today, so it is latent.
++//
++// The test calls a wrapper of its own, registered as model's are, so that it can wait for the save to end; "go
++// writeTreeUpsertQueue(page)" is named the same way, but can't be waited for without a race with the test's cleanup.
++func TestTripwireChallengeNamesAGoStatementThatCallsASaveFunction(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupStructureTransactionTest(t)
++		setupFoldTransactionDatabase(t, files)
++		FlushTxQueue()
++		backgroundRefreshWaitGroup.Wait()
++		newTripwireLog(t)
++		tripwire.SaveFunctions(tripwireChallengeWrapper)
++		page := loadTripwirePage(t, files.box.ID, files.sourcePath)
++		page.Root.SetIALAttr("custom-tripwire-go", "saved")
++
++		before := tripwire.Sites()
++		done := make(chan struct{})
++		go tripwireChallengeWrapper(page, done)
++		<-done
++		requireTripwireFileHolds(t, "the save from the go statement", tripwirePagePath(page), "custom-tripwire-go")
++		got := probeNewSites(before)
++		if 1 != len(got) || !regexp.MustCompile(`^model\.\S+ \S+\.go:\d+$`).MatchString(got[0]) {
++			t.Errorf("a go statement calling a save function outside a turn was logged at %q, want one site in model, "+
++				"the writer's", got)
++		}
++	})
++}
++
++// tripwireChallengeWrapper is a thin wrapper around WriteTree, as model's are, which says when it is done.
++//
++//go:noinline
++func tripwireChallengeWrapper(tree *parse.Tree, done chan<- struct{}) {
++	defer close(done)
++	_, _ = filesys.WriteTree(tree)
++}
++
++// probeNewSites returns the sites the tripwire recorded since before, a copy of its set. A save made on another
++// goroutine may land after save returns, so it waits up to two seconds for one.
++func probeNewSites(before map[string]tripwire.Kind) (ret []string) {
++	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
++		ret = ret[:0]
++		for site := range tripwire.Sites() {
++			if _, ok := before[site]; !ok {
++				ret = append(ret, site)
++			}
++		}
++		if 0 < len(ret) || time.Now().After(deadline) {
++			break
++		}
++	}
++	slices.Sort(ret)
++	return
++}
++
++// Probe: a save outside a turn through each of model's wrappers, and from a closure, a range-over-func body, a go
++// statement and a defer statement, is named at the writer's own line. Run it also under -race and with inlining off.
++func TestTripwireProbeNamesTheWriterThroughEveryWrapper(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupStructureTransactionTest(t)
++		setupFoldTransactionDatabase(t, files)
++		FlushTxQueue()
++		backgroundRefreshWaitGroup.Wait()
++		newTripwireLog(t)
++		page := loadTripwirePage(t, files.box.ID, files.sourcePath)
++
++		// check makes one save through save, which returns the site the tripwire should name: an exact site, or, with
++		// pattern, a regular expression for it. A page save schedules a background refresh that takes the turn 128 ms
++		// later, so check waits for those first.
++		check := func(name string, save func() (want string, pattern bool)) {
++			t.Helper()
++			backgroundRefreshWaitGroup.Wait()
++			page.Root.SetIALAttr("custom-probe", name)
++			before := tripwire.Sites()
++			want, pattern := save()
++			got := probeNewSites(before)
++			if 1 != len(got) {
++				t.Errorf("%s: the save added %d sites, want 1: %q", name, len(got), got)
++				return
++			}
++			if pattern {
++				if !regexp.MustCompile(want).MatchString(got[0]) {
++					t.Errorf("%s: the tripwire named %q, want a match for %s", name, got[0], want)
++				}
++				return
++			}
++			if want != got[0] {
++				t.Errorf("%s: the tripwire named %q, want %q", name, got[0], want)
++			}
++		}
++
++		check("writeTreeUpsertQueue", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_ = writeTreeUpsertQueue(page)
++			return site, false
++		})
++		check("writeTreeUpsertQueue0", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_, _ = writeTreeUpsertQueue0(page)
++			return site, false
++		})
++		check("indexWriteTreeIndexQueue", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_ = indexWriteTreeIndexQueue(page)
++			return site, false
++		})
++		check("indexWriteTreeUpsertQueue", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_ = indexWriteTreeUpsertQueue(page)
++			return site, false
++		})
++		check("indexWriteTreeUpsertQueue0", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_, _ = indexWriteTreeUpsertQueue0(page)
++			return site, false
++		})
++		check("renameWriteJSONQueue", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_ = renameWriteJSONQueue(page)
++			return site, false
++		})
++		check("writeRenameDoc", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_, _ = writeRenameDoc(page)
++			return site, false
++		})
++		check("writeRenameDocWith and a writer's own closure", func() (string, bool) {
++			site := siteOfSaveOnNextLine()
++			_, _ = writeRenameDocWith(page, func(tree *parse.Tree) (uint64, error) { return filesys.WriteTree(tree) })
++			return site, false
++		})
++		check("writeRenameDocIfUnchanged", func() (string, bool) {
++			original, err := os.ReadFile(tripwirePagePath(page))
++			if nil != err {
++				t.Fatal(err)
++			}
++			site := siteOfSaveOnNextLine()
++			_, _ = writeRenameDocIfUnchanged(page, original)
++			return site, false
++		})
++		check("a closure calling the wrapper", func() (string, bool) {
++			var site string
++			func() {
++				site = siteOfSaveOnNextLine()
++				_ = writeTreeUpsertQueue(page)
++			}()
++			return site, false
++		})
++		check("a range-over-func body", func() (string, bool) {
++			var site string
++			for range slices.Values([]int{1}) {
++				site = siteOfSaveOnNextLine()
++				_ = writeTreeUpsertQueue(page)
++			}
++			return site, false
++		})
++		check("a goroutine's closure", func() (string, bool) {
++			var wg sync.WaitGroup
++			wg.Add(1)
++			site := siteOfSaveOnNextLine()
++			go func() { defer wg.Done(); _ = writeTreeUpsertQueue(page) }()
++			wg.Wait()
++			// The goroutine's function is a closure in this one: "...func13.1".
++			function, fileLine, _ := strings.Cut(site, " ")
++			return "^" + regexp.QuoteMeta(function) + `\.\d+ ` + regexp.QuoteMeta(fileLine) + "$", true
++		})
++		check("a defer statement calling the wrapper", func() (string, bool) {
++			return probeDeferSave(page), true
++		})
++	})
++}
++
++// probeDeferSave saves tree from a defer statement calling the wrapper, and returns a pattern for the site. Go elides
++// the function it makes for the statement (deferwrap1) from the frames, so the site is the function the defer is in, at
++// the line where the deferred call runs, its closing brace.
++//
++//go:noinline
++func probeDeferSave(tree *parse.Tree) (want string) {
++	pc, file, line, _ := runtime.Caller(0)
++	name := runtime.FuncForPC(pc).Name()
++	want = fmt.Sprintf(`^%s\.func1 %s:%d$`, regexp.QuoteMeta(name[strings.LastIndexByte(name, '/')+1:]),
++		regexp.QuoteMeta(filepath.Base(file)), line+6)
++	func() {
++		defer writeTreeUpsertQueue(tree)
++	}()
++	return
++}
++
++// Probe: a job whose page write panics leaves no turn behind, whether it runs at once (PerformTxSync) or through the
++// queue: a save outside a turn after it is still logged.
++func TestTripwireProbeAPanickingJobLeavesNoTurn(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupAttrsCacheTest(t)
++		FlushTxQueue()
++		backgroundRefreshWaitGroup.Wait()
++
++		tx := &Transaction{DoOperations: jobAttrsOperations(files)}
++		tx.writeTransactionTree = func(*parse.Tree) error { panic("probe: the job's page write panics") }
++		_ = PerformTxSync(tx)
++		if tripwire.InTurn() {
++			t.Fatal("after a job run at once panicked, the turn is still held")
++		}
++
++		queued := &Transaction{DoOperations: jobAttrsOperations(files)}
++		queued.writeTransactionTree = func(*parse.Tree) error { panic("probe: the queued job's page write panics") }
++		PerformTransactions(&[]*Transaction{queued})
++		WaitForTransactions([]*Transaction{queued})
++		FlushTxQueue()
++		if tripwire.InTurn() {
++			t.Fatal("after a queued job panicked, the turn is still held")
++		}
++
++		log := newTripwireLog(t)
++		checkPageControl(t, log, loadTripwirePage(t, files.box.ID, files.sourcePath))
++	})
++}
+diff --git a/kernel/model/tripwire_fts5_test.go b/kernel/model/tripwire_fts5_test.go
+new file mode 100644
+index 0000000..90e6500
+--- /dev/null
++++ b/kernel/model/tripwire_fts5_test.go
+@@ -0,0 +1,687 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++// The tripwire: a save of a page or a database made while no job holds the turn (flushLock) writes one line to
++// SiYuan's log. The line holds the marker "tripwire: save outside a turn", the kind ("page" or "database") and the call
++// site, the first caller outside the save functions, as "<package.Function> <file>:<line>". Each site logs once per
++// process. Saves in a turn, the first save of a new page or database, and repairs made while loading log nothing.
++//
++// How these tests read the log: each points SiYuan's logging at a file of its own with logging.SetLogPath, as
++// SiYuan's OCR and plugin tests do, and reads the lines of that file that hold the marker. A mark, the log's length
++// before a step, keeps a check to the lines that step wrote.
++//
++// A site logs once per process, so each test runs in a process of its own: the test binary run again for that one test,
++// as SiYuan's own recovery tests do. No earlier test in the same run can have used up a site a test checks, the checks
++// that nothing is logged can't pass because a stock site logged earlier, and -count runs each test afresh.
++//
++// Each check that nothing is logged ends with a control: a save outside a turn from a site of the test's own, which
++// must log. It shows that the tripwire is on in that process and that the test reads its lines.
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"strconv"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/ast"
++	"github.com/88250/lute/parse"
++	"github.com/88250/lute/render"
++	"github.com/siyuan-note/logging"
++	"github.com/siyuan-note/siyuan/kernel/av"
++	"github.com/siyuan-note/siyuan/kernel/cache"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++const (
++	tripwireMarker = "tripwire: save outside a turn"
++	// tripwireChildEnv holds the name of the test a child process runs.
++	tripwireChildEnv = "SIYUAN_TEST_TRIPWIRE_CHILD"
++)
++
++// runTripwireTest runs body in a process of its own: the test binary, run again for this test alone. In that process it
++// runs body; here it fails the test with the process's output if the process fails.
++func runTripwireTest(t *testing.T, body func(t *testing.T)) {
++	t.Helper()
++	if os.Getenv(tripwireChildEnv) == t.Name() {
++		body(t)
++		return
++	}
++	var pattern []string
++	for _, part := range strings.Split(t.Name(), "/") {
++		pattern = append(pattern, "^"+regexp.QuoteMeta(part)+"$")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
++	defer cancel()
++	command := exec.CommandContext(ctx, os.Args[0], "-test.run="+strings.Join(pattern, "/"), "-test.count=1",
++		"-test.timeout=4m", "-test.v")
++	command.Env = append(os.Environ(), tripwireChildEnv+"="+t.Name())
++	output, err := command.CombinedOutput()
++	if nil != err {
++		t.Fatalf("the test failed in its own process (%v):\n%s", err, output)
++	}
++	if !bytes.Contains(output, []byte("--- PASS: "+t.Name()+" ")) {
++		t.Fatalf("setup: the test's own process didn't run it:\n%s", output)
++	}
++}
++
++// tripwireLog is SiYuan's log, pointed at a file of the test's own.
++type tripwireLog struct {
++	path string
++}
++
++func newTripwireLog(t *testing.T) *tripwireLog {
++	t.Helper()
++	ret := &tripwireLog{path: filepath.Join(t.TempDir(), "siyuan.log")}
++	previous := logging.LogPath
++	logging.SetLogPath(ret.path)
++	t.Cleanup(func() { logging.SetLogPath(previous) })
++	return ret
++}
++
++// mark is the log's length now: what is logged after it is what the steps since wrote.
++func (l *tripwireLog) mark(t *testing.T) int {
++	t.Helper()
++	return len(l.read(t))
++}
++
++// linesSince returns the tripwire's lines logged after mark.
++func (l *tripwireLog) linesSince(t *testing.T, mark int) (ret []string) {
++	t.Helper()
++	data := l.read(t)
++	if len(data) < mark {
++		t.Fatalf("setup: the log shrank from %d to %d bytes", mark, len(data))
++	}
++	for _, line := range strings.Split(string(data[mark:]), "\n") {
++		if strings.Contains(line, tripwireMarker) {
++			ret = append(ret, line)
++		}
++	}
++	return
++}
++
++func (l *tripwireLog) read(t *testing.T) []byte {
++	t.Helper()
++	data, err := os.ReadFile(l.path)
++	if nil != err && !os.IsNotExist(err) {
++		t.Fatal(err)
++	}
++	return data
++}
++
++// tripwireSite is a call site of a save, as the tripwire names it: "<package.Function> <file>:<line>".
++type tripwireSite struct {
++	function string // package.Function, as model.tripwireSavePageA
++	file     string // the file's base name
++	line     int
++}
++
++func (s tripwireSite) String() string {
++	return fmt.Sprintf("%s %s:%d", s.function, s.file, s.line)
++}
++
++// matches says whether line names the site. The file may be written with or without its folders.
++func (s tripwireSite) matches(line string) bool {
++	return regexp.MustCompile(regexp.QuoteMeta(s.function) + ` (?:\S*[/\\])?` + regexp.QuoteMeta(s.file) + ":" +
++		strconv.Itoa(s.line) + `\b`).MatchString(line)
++}
++
++// tripwireNextLine is the call site of the save on the line after its caller's call of it.
++//
++//go:noinline
++func tripwireNextLine() tripwireSite {
++	pc, file, line, _ := runtime.Caller(1)
++	name := runtime.FuncForPC(pc).Name()
++	if i := strings.LastIndex(name, "/"); 0 <= i {
++		name = name[i+1:]
++	}
++	return tripwireSite{function: name, file: filepath.Base(file), line: line + 1}
++}
++
++// The call sites of the saves below. Each saves outside a turn, from a site of its own.
++
++//go:noinline
++func tripwireSavePageA(tree *parse.Tree) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTree(tree)
++	return site, err
++}
++
++//go:noinline
++func tripwireSavePageB(tree *parse.Tree) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTree(tree)
++	return site, err
++}
++
++//go:noinline
++func tripwireSavePageIfUnchanged(tree *parse.Tree, original []byte) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTreeIfUnchanged(tree, original)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveNewPage(tree *parse.Tree) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTree(tree)
++	return site, err
++}
++
++//go:noinline
++func tripwireSavePageControl(tree *parse.Tree) (tripwireSite, error) {
++	site := tripwireNextLine()
++	_, err := filesys.WriteTree(tree)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveDatabaseA(attrView *av.AttributeView) (tripwireSite, error) {
++	site := tripwireNextLine()
++	err := av.SaveAttributeView(attrView)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveDatabaseB(attrView *av.AttributeView) (tripwireSite, error) {
++	site := tripwireNextLine()
++	err := av.SaveAttributeView(attrView)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveDatabaseIfUnchanged(attrView *av.AttributeView, original []byte) (tripwireSite, error) {
++	site := tripwireNextLine()
++	err := av.SaveAttributeViewIfUnchanged(attrView, original)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveNewDatabase(attrView *av.AttributeView) (tripwireSite, error) {
++	site := tripwireNextLine()
++	err := av.SaveAttributeView(attrView)
++	return site, err
++}
++
++//go:noinline
++func tripwireSaveDatabaseControl(attrView *av.AttributeView) (tripwireSite, error) {
++	site := tripwireNextLine()
++	err := av.SaveAttributeView(attrView)
++	return site, err
++}
++
++var tripwireKinds = map[string]*regexp.Regexp{
++	"page":     regexp.MustCompile(`\bpage\b`),
++	"database": regexp.MustCompile(`\bdatabase\b`),
++}
++
++// checkTripwireSite checks that lines, the tripwire's lines in a stretch of the log, hold want lines naming site, and
++// that each names the kind of what was saved and not the other kind.
++func checkTripwireSite(t *testing.T, step string, lines []string, site tripwireSite, kind string, want int) {
++	t.Helper()
++	var named []string
++	for _, line := range lines {
++		if site.matches(line) {
++			named = append(named, line)
++		}
++	}
++	if want != len(named) {
++		t.Errorf("%s: the log holds %d tripwire lines naming %s, want %d; the tripwire's lines since the test began: %q",
++			step, len(named), site, want, lines)
++		return
++	}
++	for _, line := range named {
++		for name, pattern := range tripwireKinds {
++			if (name == kind) != pattern.MatchString(line) {
++				t.Errorf("%s: the tripwire's line for %s doesn't give the kind %q alone: %q", step, site, kind, line)
++			}
++		}
++	}
++}
++
++// checkNothingLogged checks that the tripwire logged nothing since mark.
++func checkNothingLogged(t *testing.T, log *tripwireLog, mark int, step string) {
++	t.Helper()
++	if lines := log.linesSince(t, mark); 0 < len(lines) {
++		t.Errorf("%s, the tripwire logged %q", step, lines)
++	}
++}
++
++// checkPageControl saves tree outside a turn, from the control site, and checks that the tripwire logs it: the
++// tripwire is on in this process, and the test reads its lines.
++func checkPageControl(t *testing.T, log *tripwireLog, tree *parse.Tree) {
++	t.Helper()
++	mark := log.mark(t)
++	tree.Root.SetIALAttr("custom-tripwire-control", "saved")
++	site, err := tripwireSavePageControl(tree)
++	if nil != err {
++		t.Fatal(err)
++	}
++	requireTripwireFileHolds(t, "control", tripwirePagePath(tree), "custom-tripwire-control")
++	checkTripwireSite(t, "control: after a save of an existing page outside a turn", log.linesSince(t, mark), site,
++		"page", 1)
++}
++
++func tripwirePagePath(tree *parse.Tree) string {
++	return filepath.Join(util.DataDir, tree.Box, tree.Path)
++}
++
++// requireTripwireFileHolds stops the test if the file at absPath doesn't hold text: the save the test made didn't
++// write, so the test can't say what a save logs.
++func requireTripwireFileHolds(t *testing.T, step, absPath, text string) {
++	t.Helper()
++	data, err := os.ReadFile(absPath)
++	if nil != err {
++		t.Fatalf("setup: %s: %v", step, err)
++	}
++	if !bytes.Contains(data, []byte(text)) {
++		t.Fatalf("setup: %s: %s doesn't hold %q, so the save wrote nothing", step, absPath, text)
++	}
++}
++
++// loadTripwirePage loads a page through SiYuan's page load, as a writer does before it changes and saves it.
++func loadTripwirePage(t *testing.T, boxID, p string) *parse.Tree {
++	t.Helper()
++	ret, err := filesys.LoadTree(boxID, p, util.NewLute())
++	if nil != err {
++		t.Fatal(err)
++	}
++	return ret
++}
++
++// newTripwireAttributeView is a new database, not saved yet, as SiYuan makes one.
++func newTripwireAttributeView(t *testing.T, id, name string) *av.AttributeView {
++	t.Helper()
++	// A new database names its first view and keys in the database words.
++	originalAttrViewLangs := util.AttrViewLangs
++	util.AttrViewLangs = map[string]map[string]any{util.Lang: {"key": "Key", "select": "Select", "table": "Table",
++		"gallery": "Gallery", "kanban": "Kanban", "list": "List", "calendar": "Calendar"}}
++	t.Cleanup(func() { util.AttrViewLangs = originalAttrViewLangs })
++	ret := av.NewAttributeView(id)
++	ret.Name = name
++	t.Cleanup(func() { cache.RemoveAVData(id) })
++	return ret
++}
++
++// newTripwireDatabase saves a new database, its first save, and returns it.
++func newTripwireDatabase(t *testing.T, id, name string) *av.AttributeView {
++	t.Helper()
++	ret := newTripwireAttributeView(t, id, name)
++	if err := av.SaveAttributeView(ret); nil != err {
++		t.Fatal(err)
++	}
++	requireTripwireFileHolds(t, "the new database", av.GetAttributeViewDataPath(id), name)
++	return ret
++}
++
++// A save of an existing page made while no job holds the turn logs its call site, once: two saves from one site log
++// one line, and a save from another site logs a line of its own. The conditional save, WriteTreeIfUnchanged, logs too.
++// Each save changes the page, so each writes its file.
++func TestTripwireLogsAPageSaveOutsideATurnOncePerSite(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupFileOperationTest(t)
++		log := newTripwireLog(t)
++		page := loadTripwirePage(t, files.box.ID, files.sourcePath)
++		begin := log.mark(t)
++
++		page.Root.SetIALAttr("custom-tripwire", "a1")
++		siteA, err := tripwireSavePageA(page)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the first save from site A", tripwirePagePath(page), `"a1"`)
++		checkTripwireSite(t, "after the first save from site A", log.linesSince(t, begin), siteA, "page", 1)
++
++		page.Root.SetIALAttr("custom-tripwire", "a2")
++		if _, err = tripwireSavePageA(page); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the second save from site A", tripwirePagePath(page), `"a2"`)
++		checkTripwireSite(t, "after the second save from site A", log.linesSince(t, begin), siteA, "page", 1)
++
++		page.Root.SetIALAttr("custom-tripwire", "b")
++		siteB, err := tripwireSavePageB(page)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the save from site B", tripwirePagePath(page), `"b"`)
++		checkTripwireSite(t, "after the save from site B", log.linesSince(t, begin), siteB, "page", 1)
++		checkTripwireSite(t, "after the save from site B", log.linesSince(t, begin), siteA, "page", 1)
++
++		page, original, err := filesys.LoadTreeSnapshot(files.box.ID, files.sourcePath, util.NewLute())
++		if nil != err {
++			t.Fatal(err)
++		}
++		page.Root.SetIALAttr("custom-tripwire", "c")
++		siteC, err := tripwireSavePageIfUnchanged(page, original)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the conditional save", tripwirePagePath(page), `"c"`)
++		checkTripwireSite(t, "after the conditional save (WriteTreeIfUnchanged)", log.linesSince(t, begin), siteC,
++			"page", 1)
++	})
++}
++
++// A save of an existing database made while no job holds the turn logs its call site, once: two saves from one site log
++// one line, and a save from another site logs a line of its own. The conditional save, SaveAttributeViewIfUnchanged,
++// logs too. Each save renames the database, so each writes its file.
++func TestTripwireLogsADatabaseSaveOutsideATurnOncePerSite(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		setupFileOperationTest(t)
++		log := newTripwireLog(t)
++		attrView := newTripwireDatabase(t, "20261018000100-tripdb1", "Created")
++		avPath := av.GetAttributeViewDataPath(attrView.ID)
++		begin := log.mark(t)
++
++		attrView.Name = "Saved from A once"
++		siteA, err := tripwireSaveDatabaseA(attrView)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the first save from site A", avPath, attrView.Name)
++		checkTripwireSite(t, "after the first save from site A", log.linesSince(t, begin), siteA, "database", 1)
++
++		attrView.Name = "Saved from A twice"
++		if _, err = tripwireSaveDatabaseA(attrView); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the second save from site A", avPath, attrView.Name)
++		checkTripwireSite(t, "after the second save from site A", log.linesSince(t, begin), siteA, "database", 1)
++
++		attrView.Name = "Saved from B"
++		siteB, err := tripwireSaveDatabaseB(attrView)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the save from site B", avPath, attrView.Name)
++		checkTripwireSite(t, "after the save from site B", log.linesSince(t, begin), siteB, "database", 1)
++		checkTripwireSite(t, "after the save from site B", log.linesSince(t, begin), siteA, "database", 1)
++
++		original, err := os.ReadFile(avPath)
++		if nil != err {
++			t.Fatal(err)
++		}
++		attrView.Name = "Saved if unchanged"
++		siteC, err := tripwireSaveDatabaseIfUnchanged(attrView, original)
++		if nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the conditional save", avPath, attrView.Name)
++		checkTripwireSite(t, "after the conditional save (SaveAttributeViewIfUnchanged)", log.linesSince(t, begin),
++			siteC, "database", 1)
++	})
++}
++
++// setBlockAttrs, a writer that saves the page outside a turn, logs once: its first call logs one page line, named for
++// a site in SiYuan's model, and its second call, from the same site, logs nothing more.
++func TestTripwireLogsSetBlockAttrsOnce(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		files := setupStructureTransactionTest(t)
++		setupFoldTransactionDatabase(t, files)
++		log := newTripwireLog(t)
++		pagePath := filepath.Join(util.DataDir, files.box.ID, files.sourcePath)
++		begin := log.mark(t)
++
++		if err := SetBlockAttrs(files.sourceID, map[string]string{"custom-tripwire": "first"}); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the first setBlockAttrs", pagePath, `"first"`)
++		lines := log.linesSince(t, begin)
++		if 1 != len(lines) {
++			t.Fatalf("after setBlockAttrs saved the page outside a turn, the tripwire logged %d lines, want 1: %q",
++				len(lines), lines)
++		}
++		modelSite := regexp.MustCompile(`\bmodel\.\S+ (?:\S*[/\\])?\w+\.go:\d+\b`)
++		if !modelSite.MatchString(lines[0]) {
++			t.Errorf("the tripwire's line for setBlockAttrs names no call site in SiYuan's model as "+
++				"\"<package.Function> <file>:<line>\": %q", lines[0])
++		}
++		if !tripwireKinds["page"].MatchString(lines[0]) || tripwireKinds["database"].MatchString(lines[0]) {
++			t.Errorf("the tripwire's line for setBlockAttrs doesn't give the kind \"page\" alone: %q", lines[0])
++		}
++
++		if err := SetBlockAttrs(files.sourceID, map[string]string{"custom-tripwire": "second"}); nil != err {
++			t.Fatal(err)
++		}
++		requireTripwireFileHolds(t, "the second setBlockAttrs", pagePath, `"second"`)
++		if lines = log.linesSince(t, begin); 1 != len(lines) {
++			t.Errorf("after setBlockAttrs saved the page a second time, from the same site, the tripwire has logged %d "+
++				"lines, want 1: %q", len(lines), lines)
++		}
++	})
++}
++
++// A job saves a page and a database while it holds the turn, and the tripwire logs neither: an edit of a paragraph,
++// which the commit writes to the page, and a rename of a database, which saves it. The job runs through the queue, as
++// the editor's /api/transactions sends it, and at once, as PerformTxSync runs it.
++func TestTripwireLeavesSavesInATurnUnlogged(t *testing.T) {
++	for _, run := range []struct {
++		name    string
++		perform func(t *testing.T, tx *Transaction)
++	}{
++		{"a queued job", func(t *testing.T, tx *Transaction) {
++			PerformTransactions(&[]*Transaction{tx})
++			WaitForTransactions([]*Transaction{tx})
++			FlushTxQueue()
++		}},
++		{"a job run at once", func(t *testing.T, tx *Transaction) {
++			if err := PerformTxSync(tx); nil != err {
++				t.Fatal(err)
++			}
++		}},
++	} {
++		t.Run(run.name, func(t *testing.T) {
++			runTripwireTest(t, func(t *testing.T) {
++				files := setupStructureTransactionTest(t)
++				setupFoldTransactionDatabase(t, files)
++				log := newTripwireLog(t)
++				attrView := newTripwireDatabase(t, "20261018000200-tripdb2", "Before the job")
++				begin := log.mark(t)
++
++				edit := fmt.Sprintf(`<div data-node-id="%s" data-type="NodeParagraph"><div contenteditable="true">`+
++					`Saved in a job</div></div>`, files.childID)
++				tx := &Transaction{Timestamp: time.Now().UnixMilli(), DoOperations: []*Operation{
++					{Action: "update", ID: files.childID, Data: edit},
++					{Action: "setAttrViewName", ID: attrView.ID, Data: "Renamed in a job"},
++				}}
++				run.perform(t, tx)
++				requireTripwireFileHolds(t, "the job's page", filepath.Join(util.DataDir, files.box.ID, files.sourcePath),
++					"Saved in a job")
++				requireTripwireFileHolds(t, "the job's database", av.GetAttributeViewDataPath(attrView.ID),
++					"Renamed in a job")
++				checkNothingLogged(t, log, begin, "after a job saved a page and a database in its turn")
++
++				checkPageControl(t, log, loadTripwirePage(t, files.box.ID, files.sourcePath))
++			})
++		})
++	}
++}
++
++// The first save of a new page or database, whose file doesn't exist yet, logs nothing. A later save of it outside a
++// turn, from another site, logs: the file exists by then.
++func TestTripwireLeavesTheFirstSaveOfANewFileUnlogged(t *testing.T) {
++	t.Run("a page", func(t *testing.T) {
++		runTripwireTest(t, func(t *testing.T) {
++			files := setupFileOperationTest(t)
++			log := newTripwireLog(t)
++			page := treenode.NewTree(files.box.ID, "/20261018000300-trippg3.sy", "/New page", "New page")
++			t.Cleanup(func() {
++				cache.RemoveTreeData(page.ID)
++				cache.RemoveDocIAL(page.Path)
++			})
++			if _, err := os.Stat(tripwirePagePath(page)); !os.IsNotExist(err) {
++				t.Fatalf("setup: the new page's file exists before its first save: %v", err)
++			}
++			begin := log.mark(t)
++			if _, err := tripwireSaveNewPage(page); nil != err {
++				t.Fatal(err)
++			}
++			treenode.UpsertBlockTree(page)
++			requireTripwireFileHolds(t, "the new page's first save", tripwirePagePath(page), page.ID)
++			checkNothingLogged(t, log, begin, "after the first save of a new page")
++
++			checkPageControl(t, log, page)
++		})
++	})
++	t.Run("a database", func(t *testing.T) {
++		runTripwireTest(t, func(t *testing.T) {
++			setupFileOperationTest(t)
++			log := newTripwireLog(t)
++			const id = "20261018000301-tripdb3"
++			attrView := newTripwireAttributeView(t, id, "New database")
++			avPath := av.GetAttributeViewDataPath(id)
++			if _, err := os.Stat(avPath); !os.IsNotExist(err) {
++				t.Fatalf("setup: the new database's file exists before its first save: %v", err)
++			}
++			begin := log.mark(t)
++			if _, err := tripwireSaveNewDatabase(attrView); nil != err {
++				t.Fatal(err)
++			}
++			requireTripwireFileHolds(t, "the new database's first save", avPath, attrView.Name)
++			checkNothingLogged(t, log, begin, "after the first save of a new database")
++
++			// Control: the database exists now, and a save of it outside a turn logs.
++			mark := log.mark(t)
++			attrView.Name = "Saved again"
++			site, err := tripwireSaveDatabaseControl(attrView)
++			if nil != err {
++				t.Fatal(err)
++			}
++			requireTripwireFileHolds(t, "control", avPath, attrView.Name)
++			checkTripwireSite(t, "control: after a save of the database outside a turn, once it exists",
++				log.linesSince(t, mark), site, "database", 1)
++		})
++	})
++}
++
++// A repair made while loading a page logs nothing: fixTreeJSONData's write-back of a damaged page, and of a page in an
++// older format, and the rebuild of a missing parent page. Each file is written as another program would, around SiYuan,
++// and then loaded through SiYuan's page load, which repairs it.
++func TestTripwireLeavesRepairsWhileLoadingUnlogged(t *testing.T) {
++	// writeRaw writes tree's file as JSON, without SiYuan's save, and returns what it wrote.
++	writeRaw := func(t *testing.T, tree *parse.Tree) []byte {
++		t.Helper()
++		luteEngine := util.NewLute()
++		data := render.NewJSONRenderer(tree, luteEngine.RenderOptions, luteEngine.ParseOptions).Render()
++		absPath := tripwirePagePath(tree)
++		if err := os.MkdirAll(filepath.Dir(absPath), 0755); nil != err {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(absPath, data, 0644); nil != err {
++			t.Fatal(err)
++		}
++		t.Cleanup(func() {
++			cache.RemoveTreeData(tree.ID)
++			cache.RemoveDocIAL(tree.Path)
++		})
++		return data
++	}
++	// requireRewritten stops the test if loading didn't write the repaired page back: the file must have changed, and
++	// match repaired, a regular expression.
++	requireRewritten := func(t *testing.T, tree *parse.Tree, written []byte, repaired string) {
++		t.Helper()
++		data, err := os.ReadFile(tripwirePagePath(tree))
++		if nil != err {
++			t.Fatal(err)
++		}
++		if bytes.Equal(data, written) || !regexp.MustCompile(repaired).Match(data) {
++			t.Fatalf("setup: loading the page didn't write its repair back (%q):\n%s", repaired, data)
++		}
++	}
++
++	t.Run("a damaged page", func(t *testing.T) {
++		runTripwireTest(t, func(t *testing.T) {
++			files := setupFileOperationTest(t)
++			log := newTripwireLog(t)
++			// A paragraph directly under a list, which fixTreeJSONData wraps in a list item.
++			tree := treenode.NewTree(files.box.ID, "/20261018000400-trippg4.sy", "/Damaged", "Damaged")
++			paragraph := tree.Root.FirstChild
++			paragraph.Unlink()
++			list := &ast.Node{Type: ast.NodeList, ID: "20261018000400-triplst", ListData: &ast.ListData{Typ: 1}}
++			list.SetIALAttr("id", list.ID)
++			list.AppendChild(paragraph)
++			tree.Root.AppendChild(list)
++			written := writeRaw(t, tree)
++
++			begin := log.mark(t)
++			loaded := loadTripwirePage(t, files.box.ID, tree.Path)
++			requireRewritten(t, tree, written, "NodeListItem")
++			checkNothingLogged(t, log, begin, "after loading a damaged page wrote its repair back")
++
++			checkPageControl(t, log, loaded)
++		})
++	})
++	t.Run("an older-format page", func(t *testing.T) {
++		runTripwireTest(t, func(t *testing.T) {
++			files := setupFileOperationTest(t)
++			log := newTripwireLog(t)
++			// Spec 1, which fixTreeJSONData upgrades to 2.
++			tree := treenode.NewTree(files.box.ID, "/20261018000401-trippg5.sy", "/Older", "Older")
++			tree.Root.Spec = "1"
++			written := writeRaw(t, tree)
++			if !regexp.MustCompile(`"Spec":\s*"1"`).Match(written) {
++				t.Fatalf("setup: the older-format page's file doesn't say Spec 1:\n%s", written)
++			}
++
++			begin := log.mark(t)
++			loaded := loadTripwirePage(t, files.box.ID, tree.Path)
++			requireRewritten(t, tree, written, `"Spec":\s*"2"`)
++			checkNothingLogged(t, log, begin, "after loading an older-format page wrote its upgrade back")
++
++			checkPageControl(t, log, loaded)
++		})
++	})
++	t.Run("a page whose parent is missing", func(t *testing.T) {
++		runTripwireTest(t, func(t *testing.T) {
++			files := setupFileOperationTest(t)
++			log := newTripwireLog(t)
++			const parentID = "20261018000402-tripprt"
++			parentPath := filepath.Join(util.DataDir, files.box.ID, parentID+".sy")
++			t.Cleanup(func() {
++				cache.RemoveTreeData(parentID)
++				cache.RemoveDocIAL("/" + parentID + ".sy")
++			})
++			tree := treenode.NewTree(files.box.ID, "/"+parentID+"/20261018000403-tripchd.sy", "/Parent/Child", "Child")
++			writeRaw(t, tree)
++			if _, err := os.Stat(parentPath); !os.IsNotExist(err) {
++				t.Fatalf("setup: the parent page's file exists before the load: %v", err)
++			}
++
++			begin := log.mark(t)
++			loaded := loadTripwirePage(t, files.box.ID, tree.Path)
++			if _, err := os.Stat(parentPath); nil != err {
++				t.Fatalf("setup: loading the page didn't rebuild its missing parent: %v", err)
++			}
++			checkNothingLogged(t, log, begin, "after loading a page rebuilt its missing parent")
++
++			checkPageControl(t, log, loaded)
++		})
++	})
++}
+diff --git a/kernel/model/tripwire_turn_fts5_test.go b/kernel/model/tripwire_turn_fts5_test.go
+new file mode 100644
+index 0000000..fdefb17
+--- /dev/null
++++ b/kernel/model/tripwire_turn_fts5_test.go
+@@ -0,0 +1,103 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++//go:build fts5
++
++package model
++
++import (
++	"fmt"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/tripwire"
++)
++
++// siteOfSaveOnNextLine returns how the tripwire names a save made on the line after its caller's.
++func siteOfSaveOnNextLine() string {
++	pcs := make([]uintptr, 1)
++	runtime.Callers(2, pcs)
++	frame, _ := runtime.CallersFrames(pcs).Next()
++	name := frame.Function[strings.LastIndexByte(frame.Function, '/')+1:]
++	return fmt.Sprintf("%s %s:%d", name, filepath.Base(frame.File), frame.Line+1)
++}
++
++// The queue's flusher takes flushLock every 50 ms. With no job queued it runs nothing and saves nothing, so that tick is
++// no turn: a save outside a turn that lands in it is still logged. The test watches the turn for six ticks in a process
++// of its own, where nothing else takes flushLock.
++func TestTripwireTheFlushersEmptyTickIsNoTurn(t *testing.T) {
++	runTripwireTest(t, func(t *testing.T) {
++		if 0 < txQueueSize() {
++			t.Fatal("setup: a job is queued")
++		}
++		seen := 0
++		for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline); {
++			if tripwire.InTurn() {
++				seen++
++			}
++		}
++		if 0 < seen {
++			t.Fatalf("with no job queued, the turn was held at %d of the moments watched", seen)
++		}
++	})
++}
++
++// An existing page is saved three times, each from a site of its own: by a job's page write, while holding flushLock as
++// the writers that take turns with jobs do, and with no turn. Only the last is logged, and at the writer's own line:
++// the wrapper it saves through, writeTreeUpsertQueue, is passed over. Each site is checked for itself, since a site
++// stays logged for the rest of the process, as when the test runs again with -count.
++func TestTripwireLogsOnlyTheSaveMadeOutsideATurn(t *testing.T) {
++	files := setupAttrsCacheTest(t)
++	var jobSite string
++	tx := &Transaction{DoOperations: jobAttrsOperations(files)}
++	tx.writeTransactionTree = func(tree *parse.Tree) error {
++		jobSite = siteOfSaveOnNextLine()
++		return writeTreeUpsertQueue(tree)
++	}
++	if err := PerformTxSync(tx); nil != err {
++		t.Fatal(err)
++	}
++	if "" == jobSite {
++		t.Fatal("setup: the job wrote no page")
++	}
++	if _, ok := tripwire.Sites()[jobSite]; ok {
++		t.Fatalf("a job's page write was logged at %q", jobSite)
++	}
++
++	page := loadAttrsCachePageFile(t, files.box.ID, files.sourcePath)
++	page.Root.SetIALAttr("custom-locked", "saved")
++	flushLock.Lock()
++	lockedSite := siteOfSaveOnNextLine()
++	err := writeTreeUpsertQueue(page)
++	flushLock.Unlock()
++	if nil != err {
++		t.Fatal(err)
++	}
++	if _, ok := tripwire.Sites()[lockedSite]; ok {
++		t.Fatalf("a page write holding flushLock was logged at %q", lockedSite)
++	}
++
++	// A save landing while another goroutine holds flushLock, as work the job started may, is taken for one made in a
++	// turn: the tripwire can't tell which goroutine holds it. So the save is made again until one lands outside every
++	// turn.
++	var outsideSite string
++	for i := range 50 {
++		page.Root.SetIALAttr("custom-outside", fmt.Sprint(i))
++		outsideSite = siteOfSaveOnNextLine()
++		if err = writeTreeUpsertQueue(page); nil != err {
++			t.Fatal(err)
++		}
++		if _, ok := tripwire.Sites()[outsideSite]; ok {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if kind, ok := tripwire.Sites()[outsideSite]; !ok || tripwire.Page != kind {
++		t.Fatalf("a page write outside a turn wasn't logged at %q: %v", outsideSite, tripwire.Sites())
++	}
++}
+diff --git a/kernel/tripwire/challenge_test.go b/kernel/tripwire/challenge_test.go
+new file mode 100644
+index 0000000..ad5917a
+--- /dev/null
++++ b/kernel/tripwire/challenge_test.go
+@@ -0,0 +1,68 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++package tripwire
++
++// The challenger's measures of what a save costs the tripwire (issue #43, step 5). They assert nothing:
++// go test -run '^$' -bench Challenge -benchmem ./tripwire/
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// benchSetup gives the benchmark a file that exists, a log that drops its lines, and an empty site set.
++func benchSetup(b *testing.B) string {
++	b.Helper()
++	p := filepath.Join(b.TempDir(), "20261018000000-bench01.sy")
++	if err := os.WriteFile(p, []byte("{}"), 0644); err != nil {
++		b.Fatal(err)
++	}
++	previous := logWarnf
++	logWarnf = func(string, ...any) {}
++	sites.Lock()
++	seen, full := sites.seen, sites.full
++	sites.seen, sites.full = map[string]Kind{}, false
++	sites.Unlock()
++	b.Cleanup(func() {
++		logWarnf = previous
++		sites.Lock()
++		sites.seen, sites.full = seen, full
++		sites.Unlock()
++	})
++	return p
++}
++
++// deepSave calls Save depth frames down, as a writer in model does through its callers.
++//
++//go:noinline
++func deepSave(depth int, kind Kind, p string) {
++	if 0 < depth {
++		deepSave(depth-1, kind, p)
++		return
++	}
++	Save(kind, p)
++}
++
++// A save inside a turn: one atomic load.
++func BenchmarkChallengeSaveInATurn(b *testing.B) {
++	p := benchSetup(b)
++	EnterTurn()
++	defer LeaveTurn()
++	b.ReportAllocs()
++	for b.Loop() {
++		deepSave(20, Page, p)
++	}
++}
++
++// A save outside a turn from a site already logged, the case of polka's getAttributeViewKeys every 250 ms: a stat, the
++// stack walk and a look in the site set.
++func BenchmarkChallengeSaveOutsideATurnFromALoggedSite(b *testing.B) {
++	p := benchSetup(b)
++	b.ReportAllocs()
++	for b.Loop() {
++		deepSave(20, Database, p)
++	}
++}
+diff --git a/kernel/tripwire/tripwire.go b/kernel/tripwire/tripwire.go
+new file mode 100644
+index 0000000..c344b83
+--- /dev/null
++++ b/kernel/tripwire/tripwire.go
+@@ -0,0 +1,286 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++// Package tripwire names the writers that save pages and databases without taking turns with jobs. A save made while
++// no job holds the turn is logged once per call site, with the caller it was first seen with, and then once for each
++// further caller of that site:
++//
++//	tripwire: save outside a turn: page model.setNodeAttrs blockial.go:269 <- model.SetBlockAttrs blockial.go:247
++//	tripwire: another caller of a save outside a turn: page model.setNodeAttrs blockial.go:269 <-
++//	    model.setDatabaseBlockView attribute_view.go:2594 (one line)
++//
++// The turn is model's flushLock: the queue's jobs, PerformTxSync and the commit hold it, and so do the writers that
++// already take turns with jobs. Locking flushLock enters the turn and unlocking it leaves (EnterTurn, LeaveTurn). The
++// save functions (filesys.WriteTree and WriteTreeIfUnchanged, av.SaveAttributeView and SaveAttributeViewIfUnchanged)
++// call Save before they write. Inside a turn that costs one atomic load. Outside one, Save passes over a file that
++// doesn't exist yet, the first save of a brand-new page or database, and otherwise finds the first caller outside the
++// save functions, the site, and that function's own caller. The site's first save logs the marker's line; a save from
++// a caller the site hasn't been seen with logs CallerMarker's line. So a helper that several writers save through is
++// named once for each of them, while the marker's lines stay one per site.
++//
++// It's a guide, not a proof. Go can't tell which goroutine holds a lock, so the turn says only that some goroutine
++// holds flushLock: a save made outside a turn while another goroutine holds one isn't logged. A site is logged once it
++// saves outside every turn; one that only ever saves during other turns is never named.
++//
++// It changes no behaviour: it takes no lock but its own, which are leaves, drops nothing from any cache and never fails
++// a save.
++package tripwire
++
++import (
++	"errors"
++	"io/fs"
++	"os"
++	"path"
++	"reflect"
++	"runtime"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++
++	"github.com/siyuan-note/logging"
++)
++
++// Kind is what a save writes.
++type Kind string
++
++const (
++	Page     Kind = "page"
++	Database Kind = "database"
++)
++
++// Marker starts the line the tripwire logs for a site's first save outside a turn.
++const Marker = "tripwire: save outside a turn"
++
++// CallerMarker starts the line the tripwire logs for a further caller of a site already logged.
++const CallerMarker = "tripwire: another caller of a save outside a turn"
++
++// turns counts the holders of the turn. flushLock is a mutex, so it is 0 or 1 in the kernel.
++var turns atomic.Int32
++
++// EnterTurn is called by flushLock's holder once it has the lock.
++func EnterTurn() {
++	turns.Add(1)
++}
++
++// LeaveTurn is called by flushLock's holder before it unlocks.
++func LeaveTurn() {
++	turns.Add(-1)
++}
++
++// InTurn reports whether some goroutine holds the turn.
++func InTurn() bool {
++	return 0 < turns.Load()
++}
++
++// Save is called by a save function before it writes path, the file of a page or a database. A save while some
++// goroutine holds the turn costs one atomic load, and nothing else. path "" means the file doesn't exist yet.
++func Save(kind Kind, path string) {
++	if InTurn() {
++		return
++	}
++	saveOutsideTurn(kind, path, nil)
++}
++
++// SaveMovable is Save for a save function that can tell where what it saves lives now. When path has no file,
++// movedAway reports whether the page or database lives at another path: then the save isn't the first save of a
++// brand-new file, but a writer putting a copy back where its page was before a move, and it is logged. movedAway runs
++// only outside a turn, and only when path has no file.
++func SaveMovable(kind Kind, path string, movedAway func() bool) {
++	if InTurn() {
++		return
++	}
++	saveOutsideTurn(kind, path, movedAway)
++}
++
++func saveOutsideTurn(kind Kind, path string, movedAway func() bool) {
++	if "" == path {
++		return
++	}
++	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) && (nil == movedAway || !movedAway()) {
++		// The first save of a brand-new page or database: nothing older can be lost.
++		return
++	}
++	site, caller := callSite()
++	entry := site
++	if "" != caller {
++		entry += " <- " + caller
++	}
++	firstSite, newCaller, full := note(kind, site, entry)
++	if full {
++		logWarnf("%s: more than %d call sites and callers; saves from further ones are not logged", Marker, siteLimit)
++	}
++	if firstSite {
++		logWarnf("%s: %s %s", Marker, kind, entry)
++	} else if newCaller {
++		logWarnf("%s: %s %s", CallerMarker, kind, entry)
++	}
++}
++
++// logWarnf is logging.LogWarnf; the package's tests replace it.
++var logWarnf = logging.LogWarnf
++
++// testHookCallSite, when set by a test, is called each time Save looks for its caller.
++var testHookCallSite func()
++
++// callSite returns the first caller outside the save functions, the site, as "<package.Function> <file>:<line>", and
++// the site's own caller in the same form: "" when the site is a goroutine's first function.
++//
++// A go statement that calls a save function directly, "go writeTreeUpsertQueue(tree)", leaves no writer's frame:
++// runtime.CallersFrames leaves out the function Go makes for the statement (F.gowrap1), so past the save functions the
++// walk reaches the goroutine's start, runtime.goexit. Then callSite names the outermost save function it passed, at its
++// call of the next, and gives "go statement" as its caller. A defer statement's function (F.deferwrap1) is left out
++// too, but its caller is the function the defer sits in, which is named at its closing brace.
++func callSite() (site, caller string) {
++	if nil != testHookCallSite {
++		testHookCallSite()
++	}
++	var pcs [48]uintptr
++	n := runtime.Callers(1, pcs[:])
++	frames := runtime.CallersFrames(pcs[:n])
++	var outermost runtime.Frame
++	frame, more := frames.Next()
++	for "" != frame.Function {
++		var next runtime.Frame
++		if more {
++			next, more = frames.Next()
++		}
++		// A closure is part of the save when it sits in a save function, or when a save function calls it: once the
++		// function it sits in is inlined, Go names the closure after the caller it was inlined into
++		// ("model.renameDoc.writeRenameDocIfUnchanged.func1").
++		if !isSaveFunction(frame.Function) && !(isClosure(frame.Function) && isSaveFunction(next.Function)) {
++			if "runtime.goexit" == frame.Function && "" != outermost.Function {
++				return formatFrame(outermost), "go statement"
++			}
++			if "" == next.Function || strings.HasPrefix(next.Function, "runtime.") {
++				return formatFrame(frame), ""
++			}
++			return formatFrame(frame), formatFrame(next)
++		}
++		outermost = frame
++		frame = next
++	}
++	if "" != outermost.Function {
++		// More frames than callSite reads: the outermost save function it read is at least a site of its own.
++		return formatFrame(outermost), ""
++	}
++	return "unknown", ""
++}
++
++func formatFrame(frame runtime.Frame) string {
++	return shortFunction(frame.Function) + " " + path.Base(frame.File) + ":" + strconv.Itoa(frame.Line)
++}
++
++// isClosure reports whether name is a function literal's: "pkg.F.func1", or "pkg.F.func1.2" for one inside another. The
++// functions Go makes for go and defer statements (F.gowrap1, F.deferwrap1) never reach it: runtime.CallersFrames leaves
++// them out.
++func isClosure(name string) bool {
++	last := name[strings.LastIndexByte(name, '.')+1:]
++	if isNumber(last) {
++		return true
++	}
++	number, ok := strings.CutPrefix(last, "func")
++	return ok && isNumber(number)
++}
++
++func isNumber(s string) bool {
++	return "" != s && "" == strings.TrimLeft(s, "0123456789")
++}
++
++// shortFunction drops the import path before the package's name: "model.setNodeAttrs",
++// "model.(*Transaction).commit".
++func shortFunction(name string) string {
++	if i := strings.LastIndexByte(name, '/'); 0 <= i {
++		return name[i+1:]
++	}
++	return name
++}
++
++// saveFunctions holds the full names of the functions a save passes through before the writer's own code: the
++// tripwire's, the save functions' and the thin wrappers around them. callSite passes over them, and over the closures
++// inside them.
++var saveFunctions = struct {
++	sync.RWMutex
++	names map[string]struct{}
++}{names: map[string]struct{}{}}
++
++// SaveFunctions adds functions a save passes through before the writer's own code, so the writer's call is named
++// instead of theirs. Each is a function value, such as filesys.WriteTree.
++func SaveFunctions(fns ...any) {
++	saveFunctions.Lock()
++	defer saveFunctions.Unlock()
++	for _, fn := range fns {
++		v := reflect.ValueOf(fn)
++		if reflect.Func != v.Kind() || v.IsNil() {
++			continue
++		}
++		if f := runtime.FuncForPC(v.Pointer()); nil != f {
++			saveFunctions.names[f.Name()] = struct{}{}
++		}
++	}
++}
++
++func isSaveFunction(name string) bool {
++	saveFunctions.RLock()
++	defer saveFunctions.RUnlock()
++	if _, ok := saveFunctions.names[name]; ok {
++		return true
++	}
++	// A closure is named after the function it sits in: "model.writeRenameDocIfUnchanged.func1".
++	for i := strings.LastIndexByte(name, '.'); 0 < i; i = strings.LastIndexByte(name[:i], '.') {
++		if _, ok := saveFunctions.names[name[:i]]; ok {
++			return true
++		}
++	}
++	return false
++}
++
++func init() {
++	SaveFunctions(Save, SaveMovable, saveOutsideTurn, callSite)
++}
++
++// siteLimit bounds the lines remembered, one per site and caller. The kernel has a few hundred call sites of the save
++// functions, each with a few callers; once the limit is reached, further ones are not logged, and that is logged once.
++var siteLimit = 4096
++
++var sites = struct {
++	sync.Mutex
++	seen   map[string]Kind     // each site logged, with its kind
++	logged map[string]struct{} // each "site <- caller" logged
++	full   bool
++}{seen: map[string]Kind{}, logged: map[string]struct{}{}}
++
++// note records entry, a site and its caller. It reports whether the site is new, whether only the caller is, and
++// whether this call found the set full for the first time.
++func note(kind Kind, site, entry string) (firstSite, newCaller, full bool) {
++	sites.Lock()
++	defer sites.Unlock()
++	if _, ok := sites.logged[entry]; ok {
++		return false, false, false
++	}
++	if len(sites.logged) >= siteLimit {
++		if sites.full {
++			return false, false, false
++		}
++		sites.full = true
++		return false, false, true
++	}
++	sites.logged[entry] = struct{}{}
++	if _, ok := sites.seen[site]; ok {
++		return false, true, false
++	}
++	sites.seen[site] = kind
++	return true, false, false
++}
++
++// Sites returns the call sites logged so far, without their callers, each with the kind of save it made.
++func Sites() map[string]Kind {
++	sites.Lock()
++	defer sites.Unlock()
++	ret := make(map[string]Kind, len(sites.seen))
++	for site, kind := range sites.seen {
++		ret[site] = kind
++	}
++	return ret
++}
+diff --git a/kernel/tripwire/tripwire_test.go b/kernel/tripwire/tripwire_test.go
+new file mode 100644
+index 0000000..681025f
+--- /dev/null
++++ b/kernel/tripwire/tripwire_test.go
+@@ -0,0 +1,389 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++// SPDX-License-Identifier: AGPL-3.0-or-later
++
++package tripwire
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"reflect"
++	"regexp"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/siyuan-note/logging"
++)
++
++// captureLog replaces the log with a list of lines for the test, and starts it with no site seen.
++func captureLog(t *testing.T) *[]string {
++	t.Helper()
++	var mu sync.Mutex
++	lines := []string{}
++	previous := logWarnf
++	logWarnf = func(format string, v ...any) {
++		mu.Lock()
++		defer mu.Unlock()
++		lines = append(lines, fmt.Sprintf(format, v...))
++	}
++	sites.Lock()
++	seen, logged, full := sites.seen, sites.logged, sites.full
++	sites.seen, sites.logged, sites.full = map[string]Kind{}, map[string]struct{}{}, false
++	sites.Unlock()
++	t.Cleanup(func() {
++		logWarnf = previous
++		sites.Lock()
++		sites.seen, sites.logged, sites.full = seen, logged, full
++		sites.Unlock()
++	})
++	return &lines
++}
++
++// existingFile returns the path of a file that exists, as a saved page's or database's does.
++func existingFile(t *testing.T) string {
++	t.Helper()
++	p := filepath.Join(t.TempDir(), "20261018000000-page001.sy")
++	if err := os.WriteFile(p, []byte("{}"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++// nextLine returns the line after its caller's.
++func nextLine() int {
++	_, _, line, _ := runtime.Caller(1)
++	return line + 1
++}
++
++func site(function string, line int) string {
++	return fmt.Sprintf("tripwire.%s tripwire_test.go:%d", function, line)
++}
++
++// requireLines checks the lines logged, each without the caller after its site, " <- ...", but for a go statement's.
++func requireLines(t *testing.T, what string, lines *[]string, want ...string) {
++	t.Helper()
++	var got []string
++	for _, line := range *lines {
++		if site, caller, ok := strings.Cut(line, " <- "); ok && "go statement" != caller {
++			line = site
++		}
++		got = append(got, line)
++	}
++	if fmt.Sprint(got) != fmt.Sprint(want) {
++		t.Fatalf("%s logged %q, want %q", what, *lines, want)
++	}
++}
++
++// saveAt is one call site, shared by the tests that save from the same site inside and outside a turn.
++var saveAtLine = nextLine() + 1
++
++func saveAt(kind Kind, p string) { Save(kind, p) }
++
++func TestSaveOutsideATurnLogsItsSiteOnce(t *testing.T) {
++	lines := captureLog(t)
++	page, database := existingFile(t), existingFile(t)
++
++	line := nextLine() + 1
++	for range 3 {
++		Save(Page, page)
++	}
++	first := Marker + ": page " + site("TestSaveOutsideATurnLogsItsSiteOnce", line)
++	requireLines(t, "three saves from one site", lines, first)
++
++	line = nextLine()
++	Save(Database, database)
++	second := Marker + ": database " + site("TestSaveOutsideATurnLogsItsSiteOnce", line)
++	requireLines(t, "a save from a second site", lines, first, second)
++	if got := Sites(); 2 != len(got) || Database != got[site("TestSaveOutsideATurnLogsItsSiteOnce", line)] {
++		t.Fatalf("Sites() = %v", got)
++	}
++}
++
++func TestSaveInsideATurnLogsNothingAndFindsNoCaller(t *testing.T) {
++	lines := captureLog(t)
++	page := existingFile(t)
++	walks := 0
++	testHookCallSite = func() { walks++ }
++	t.Cleanup(func() { testHookCallSite = nil })
++
++	EnterTurn()
++	saveAt(Page, page)
++	if allocs := testing.AllocsPerRun(100, func() { saveAt(Page, page) }); 0 != allocs {
++		t.Errorf("a save inside a turn allocated %v times", allocs)
++	}
++	LeaveTurn()
++	if 0 != len(*lines) || 0 != walks {
++		t.Fatalf("saves inside a turn logged %q and looked for their caller %d times", *lines, walks)
++	}
++
++	// The site isn't remembered from inside the turn: its first save outside one is logged.
++	saveAt(Page, page)
++	requireLines(t, "the save after the turn", lines, Marker+": page "+site("saveAt", saveAtLine))
++}
++
++func TestLineReachesSiYuansLog(t *testing.T) {
++	sites.Lock()
++	seen, logged, full := sites.seen, sites.logged, sites.full
++	sites.seen, sites.logged, sites.full = map[string]Kind{}, map[string]struct{}{}, false
++	sites.Unlock()
++	previous := logging.LogPath
++	logPath := filepath.Join(t.TempDir(), "siyuan.log")
++	logging.SetLogPath(logPath)
++	t.Cleanup(func() {
++		logging.SetLogPath(previous)
++		sites.Lock()
++		sites.seen, sites.logged, sites.full = seen, logged, full
++		sites.Unlock()
++	})
++
++	line := nextLine()
++	Save(Database, existingFile(t))
++	data, err := os.ReadFile(logPath)
++	if nil != err {
++		t.Fatal(err)
++	}
++	want := Marker + ": database " + site("TestLineReachesSiYuansLog", line) + " <- testing.tRunner testing.go:"
++	if got := strings.TrimSpace(string(data)); !strings.HasPrefix(got, "W ") || !strings.Contains(got, want) || 1 != strings.Count(got, "\n")+1 {
++		t.Fatalf("SiYuan's log holds %q, want one warning holding %q", got, want)
++	}
++}
++
++func TestSaveMovableLogsACopyPutBackWhereItsPageWas(t *testing.T) {
++	lines := captureLog(t)
++	missing := filepath.Join(t.TempDir(), "20261018000000-page003.sy")
++	asked := 0
++	moved := false
++	movedAway := func() bool {
++		asked++
++		return moved
++	}
++
++	line := nextLine()
++	SaveMovable(Page, missing, movedAway)
++	requireLines(t, "a save of a new page, which lives nowhere else", lines)
++	if 1 != asked {
++		t.Fatalf("the save of a missing file asked where its page lives %d times, want 1", asked)
++	}
++
++	moved = true
++	line = nextLine()
++	SaveMovable(Page, missing, movedAway)
++	requireLines(t, "a save of a page that moved, at the path it left", lines,
++		Marker+": page "+site("TestSaveMovableLogsACopyPutBackWhereItsPageWas", line))
++
++	// Where the page lives is asked only outside a turn, and only when the path has no file.
++	asked = 0
++	SaveMovable(Page, existingFile(t), movedAway)
++	EnterTurn()
++	SaveMovable(Page, missing, movedAway)
++	if allocs := testing.AllocsPerRun(100, func() { SaveMovable(Page, missing, func() bool { return moved }) }); 0 != allocs {
++		t.Errorf("a save inside a turn allocated %v times", allocs)
++	}
++	LeaveTurn()
++	if 0 != asked {
++		t.Fatalf("saves of an existing file, or inside a turn, asked where the page lives %d times", asked)
++	}
++}
++
++// testGoWrapper is a registered wrapper that a go statement calls directly. Its call of Save is two lines below its
++// first.
++//
++//go:noinline
++func testGoWrapper(p string, done chan<- struct{}) {
++	defer close(done)
++	Save(Page, p)
++}
++
++func TestAGoStatementCallingASaveFunctionNamesTheSaveFunction(t *testing.T) {
++	lines := captureLog(t)
++	const name = "github.com/siyuan-note/siyuan/kernel/tripwire.testGoWrapper"
++	SaveFunctions(testGoWrapper)
++	t.Cleanup(func() {
++		saveFunctions.Lock()
++		delete(saveFunctions.names, name)
++		saveFunctions.Unlock()
++	})
++	entry := reflect.ValueOf(testGoWrapper).Pointer()
++	_, line := runtime.FuncForPC(entry).FileLine(entry)
++	line += 2
++
++	done := make(chan struct{})
++	go testGoWrapper(existingFile(t), done)
++	<-done
++	// The go statement leaves no writer's frame: past the wrapper, the walk reaches the goroutine's start. The wrapper is
++	// named, at its call of Save, and marked as a go statement.
++	requireLines(t, "a go statement calling a wrapper", lines,
++		Marker+": page "+site("testGoWrapper", line)+" <- go statement")
++}
++
++// testSharedHelper is a writer that other writers save through: a site with several callers.
++//
++//go:noinline
++func testSharedHelper(p string) {
++	Save(Page, p)
++}
++
++//go:noinline
++func testHelperCallerOne(p string) {
++	testSharedHelper(p)
++}
++
++//go:noinline
++func testHelperCallerTwo(p string) {
++	testSharedHelper(p)
++}
++
++func TestTwoCallersOfOneHelperGiveTwoLines(t *testing.T) {
++	lines := captureLog(t)
++	page := existingFile(t)
++	testHelperCallerOne(page)
++	testHelperCallerOne(page)
++	testHelperCallerTwo(page)
++	testHelperCallerTwo(page)
++	helper := `tripwire\.testSharedHelper tripwire_test\.go:\d+`
++	want := []*regexp.Regexp{
++		regexp.MustCompile("^" + Marker + ": page " + helper + ` <- tripwire\.testHelperCallerOne tripwire_test\.go:\d+$`),
++		regexp.MustCompile("^" + CallerMarker + ": page " + helper + ` <- tripwire\.testHelperCallerTwo tripwire_test\.go:\d+$`),
++	}
++	if len(want) != len(*lines) {
++		t.Fatalf("two callers of one helper, twice each, logged %q, want one line for each caller", *lines)
++	}
++	for i, line := range *lines {
++		if !want[i].MatchString(line) {
++			t.Errorf("line %d is %q, want a match for %s", i, line, want[i])
++		}
++	}
++	if 1 != len(Sites()) {
++		t.Errorf("Sites() = %v, want the helper's site alone", Sites())
++	}
++}
++
++func TestTurnsCountTheirHolders(t *testing.T) {
++	if InTurn() {
++		t.Fatal("in a turn before any was entered")
++	}
++	EnterTurn()
++	EnterTurn()
++	LeaveTurn()
++	if !InTurn() {
++		t.Fatal("not in a turn while one holder is left")
++	}
++	LeaveTurn()
++	if InTurn() {
++		t.Fatal("still in a turn after every holder left")
++	}
++}
++
++func TestFirstSaveOfANewFileIsNotLogged(t *testing.T) {
++	lines := captureLog(t)
++	page := filepath.Join(t.TempDir(), "20261018000000-page002.sy")
++
++	saveAt(Page, page)
++	saveAt(Database, "")
++	requireLines(t, "saves of new files", lines)
++
++	// A new file's first save leaves its site unseen: the site's next save of a file that exists is logged.
++	if err := os.WriteFile(page, []byte("{}"), 0644); err != nil {
++		t.Fatal(err)
++	}
++	saveAt(Page, page)
++	requireLines(t, "the save of the file once it existed", lines, Marker+": page "+site("saveAt", saveAtLine))
++}
++
++// testSaveWrapper stands for a save function and the wrappers around it: it saves through a closure of its own. The
++// compiler may inline it into its caller, and then names the closure after the caller.
++func testSaveWrapper(p string) {
++	func() {
++		Save(Page, p)
++	}()
++}
++
++// testSaveWrapperNotInlined is testSaveWrapper, never inlined: its closure keeps its own name.
++//
++//go:noinline
++func testSaveWrapperNotInlined(p string) {
++	func() {
++		Save(Page, p)
++	}()
++}
++
++func TestSiteIsTheFirstCallerOutsideTheSaveFunctions(t *testing.T) {
++	lines := captureLog(t)
++	const prefix = "github.com/siyuan-note/siyuan/kernel/tripwire."
++	SaveFunctions(testSaveWrapper, testSaveWrapperNotInlined)
++	t.Cleanup(func() {
++		saveFunctions.Lock()
++		delete(saveFunctions.names, prefix+"testSaveWrapper")
++		delete(saveFunctions.names, prefix+"testSaveWrapperNotInlined")
++		saveFunctions.Unlock()
++	})
++	if !isSaveFunction(prefix+"testSaveWrapper") || !isSaveFunction(prefix+"testSaveWrapper.func1") ||
++		isSaveFunction(prefix+"testSaveWrapper2") {
++		t.Fatal("SaveFunctions didn't record testSaveWrapper and its closures alone")
++	}
++
++	line := nextLine()
++	testSaveWrapper(existingFile(t))
++	notInlined := nextLine()
++	testSaveWrapperNotInlined(existingFile(t))
++	requireLines(t, "saves through wrappers", lines,
++		Marker+": page "+site("TestSiteIsTheFirstCallerOutsideTheSaveFunctions", line),
++		Marker+": page "+site("TestSiteIsTheFirstCallerOutsideTheSaveFunctions", notInlined))
++}
++
++func TestIsClosure(t *testing.T) {
++	for name, want := range map[string]bool{
++		"model.writeRenameDocIfUnchanged.func1":            true,
++		"model.renameDoc.writeRenameDocIfUnchanged.func12": true,
++		"model.(*Transaction).commit.func1.2":              true,
++		// Go's functions for go and defer statements never reach isClosure: CallersFrames leaves them out.
++		"model.setNodeAttrs.gowrap1":                        false,
++		"model.setNodeAttrs.deferwrap3":                     false,
++		"model.setNodeAttrs":                                false,
++		"model.function":                                    false,
++		"model.func2Pages":                                  false,
++		"github.com/siyuan-note/siyuan/kernel/model.funcs1": false,
++	} {
++		if got := isClosure(name); got != want {
++			t.Errorf("isClosure(%q) = %v, want %v", name, got, want)
++		}
++	}
++}
++
++func TestShortFunctionKeepsThePackageName(t *testing.T) {
++	for name, want := range map[string]string{
++		"github.com/siyuan-note/siyuan/kernel/model.setNodeAttrs":          "model.setNodeAttrs",
++		"github.com/siyuan-note/siyuan/kernel/model.(*Transaction).commit": "model.(*Transaction).commit",
++		"github.com/siyuan-note/siyuan/kernel/mcp/tools.handleFile.func2":  "tools.handleFile.func2",
++		"main.main": "main.main",
++	} {
++		if got := shortFunction(name); got != want {
++			t.Errorf("shortFunction(%q) = %q, want %q", name, got, want)
++		}
++	}
++}
++
++func TestSitesBeyondTheLimitAreNotLogged(t *testing.T) {
++	lines := captureLog(t)
++	previous := siteLimit
++	siteLimit = 2
++	t.Cleanup(func() { siteLimit = previous })
++	page := existingFile(t)
++
++	first := nextLine()
++	Save(Page, page)
++	second := nextLine()
++	Save(Page, page)
++	Save(Page, page)
++	Save(Page, page)
++	requireLines(t, "four sites with a limit of two", lines,
++		Marker+": page "+site("TestSitesBeyondTheLimitAreNotLogged", first),
++		Marker+": page "+site("TestSitesBeyondTheLimitAreNotLogged", second),
++		Marker+": more than 2 call sites and callers; saves from further ones are not logged")
++	if 2 != len(Sites()) {
++		t.Fatalf("remembered %d sites past a limit of two", len(Sites()))
++	}
++}
+-- 
+2.53.0
+

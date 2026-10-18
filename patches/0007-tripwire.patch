@@ -1,6 +1,6 @@
-From 0e7f57485e4fdb8b60a46f9375b4040a3e055dd7 Mon Sep 17 00:00:00 2001
+From 1591063c837a294ba7f6f8204df65a209a8b1134 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
-Date: Sun, 18 Oct 2026 12:04:59 -0400
+Date: Sun, 18 Oct 2026 13:11:12 -0400
 Subject: [PATCH] A save outside a job's turn logs where it came from
 
 SiYuan's jobs read, change and save pages and databases while they hold

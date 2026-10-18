@@ -15,7 +15,11 @@ WORKDIR /src/kernel
 ENV CGO_ENABLED=1
 RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg \
     go test -tags "fts5 sqlcipher" ./mcp/ \
-    && go test -tags "fts5 sqlcipher" -run '^TestAttributeViewPropertyGuard|^TestSystemPageGuard|^TestSearchLeavesBlocksWhole' ./model/ \
+    && go test -tags "fts5 sqlcipher" -run '^TestAttributeViewPropertyGuard|^TestSystemPageGuard|^TestSearchLeavesBlocksWhole|^(TestMoveToAnotherNotebookAndBackKeepsEdits|TestMoveAfterEditReadsNewType|TestRollbackDocHistoryRestoresAttributes|TestRollbackRepoSnapshotFileRestoresAttributes|TestRestoreRemovedBlockReadsNoAttributes|TestOlderPageAttributesStoredAfterASaveAreNotServed|TestJobAttributesAreNotServedBeforeItsPageIsWritten|TestFailedCommitCachesNothing|TestNewRowPageReadsWithItsDatabase|TestGroupedTableCellEditKeepsStaticText|TestDocToHeadingServesTheHeadingsAttributes)$' ./model/ \
+    && go test -tags "fts5 sqlcipher" -run '^(TestReadCheckRefusesCopiesOlderThanTheirPage|TestBlockAttributesWithoutTheirPageAreNotServed|TestDroppingBlockAttributesRaisesTheirPage|TestClearingACacheMakesOnlyItsEntriesMiss|TestForgettingVersionsKeepsOtherEntries|TestFillVersionsForgetPastTheirLimit|TestConcurrentRaisesNeverLowerTheFloor|TestForgettingVersionsStallsReadsBriefly|TestOverlappingClearsKeepTheLaterFloor|TestWriteEndsCacheOnlyWithoutAnotherRaise)$' ./cache/ \
+    && go test -tags "fts5 sqlcipher" -run '^(TestTreeFillRacesWrite|TestTreeFillsRacingASaveServeTheSave|TestOverlappingWritesOfAPageCacheWhatTheFileHolds|TestPanickingPageWriteRaisesItsPageAndReleasesItsLocks)$' ./filesys/ \
+    && go test -tags "fts5 sqlcipher" -run '^(TestBatchGetBlockAttrsWitTreesCachesNothing|TestBlockAttrsReadsFillWhatTheyLoad|TestBlockAttrsFillThenWriteKeepsWrite|TestPageWritesMakeOlderBlockAttrsMiss|TestBlockAttrsReadBeforeTheirPageChangedAreNotServed|TestKanbanRenderAfterAWriteServesNewAttributes)$' ./sql/ \
+    && go test -tags "fts5 sqlcipher" -run '^(TestAVReadAfterSaveGivesTheSave|TestAVSaveOfUnchangedCopyRacingASaveKeepsTheSave|TestAVHistoryReadLeavesTheLiveEntry|TestAVDropRacingAFillInANotebookLeavesNoOlderCopy|TestAVOverlappingSavesCacheWhatTheFileHolds|TestAVSaveWithoutOverlapIsServedFromTheCache|TestPanickingDatabaseSaveRaisesItsVersionAndReleasesItsLocks)$' ./av/ \
     && go build -tags "fts5 sqlcipher" -ldflags "-s -w"
 
 FROM b3log/siyuan:${SIYUAN_VERSION}

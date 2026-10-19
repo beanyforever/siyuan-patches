@@ -1,4 +1,4 @@
-From 8609c7dce40f3f7e44ef96f245d22237d6caf856 Mon Sep 17 00:00:00 2001
+From afbbf64a2ad61e3a3eaf31fee4fddc90370ad2af Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 17:23:05 -0400
 Subject: [PATCH] Databases refuse edits that destroy property values

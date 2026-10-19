@@ -1,4 +1,4 @@
-From 1591063c837a294ba7f6f8204df65a209a8b1134 Mon Sep 17 00:00:00 2001
+From 6f50c1eaaaf5da27d715cffaa8cc5a0e3d1a5f88 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 13:11:12 -0400
 Subject: [PATCH] A save outside a job's turn logs where it came from

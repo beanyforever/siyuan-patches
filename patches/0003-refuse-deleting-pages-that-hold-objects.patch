@@ -1,4 +1,4 @@
-From fb2044bf39f81f271d2fac75a65a8d963c4072e5 Mon Sep 17 00:00:00 2001
+From 812568e7655675aae74b5cf772f31d48f85dfe16 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 20:51:37 -0400
 Subject: [PATCH] Deleting a page or a notebook that holds a Type's pages is

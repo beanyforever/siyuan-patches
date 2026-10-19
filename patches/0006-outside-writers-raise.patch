@@ -1,4 +1,4 @@
-From 696bdc0deaabf62fc6d857ffa4e2e62560950d6e Mon Sep 17 00:00:00 2001
+From 8cbd37e4e9f2bf2c8744dbf3fef7ed9b46f62349 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 13:11:12 -0400
 Subject: [PATCH] Writers outside WriteTree and saveAttributeView raise what
@@ -2362,7 +2362,7 @@ index 99ebfc9..37b872f 100644
  		panic(err)
  	}
 diff --git a/kernel/model/assets.go b/kernel/model/assets.go
-index 044b519..6b1eba8 100644
+index d39e192..b2cf77b 100644
 --- a/kernel/model/assets.go
 +++ b/kernel/model/assets.go
 @@ -1872,7 +1872,9 @@ func RenameAsset(oldPath, newName string) (newPath string, err error) {

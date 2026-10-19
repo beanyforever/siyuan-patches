@@ -1,4 +1,4 @@
-From b4d4f4d69523e33a98ef095ea532e70394b2e462 Mon Sep 17 00:00:00 2001
+From 3c6d4d78127106aa38f0e3dfd8279adf1470d963 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 22:04:10 -0400
 Subject: [PATCH] Writers outside the job queue read, change and save in a turn
@@ -130,7 +130,7 @@ index 0cc1ab8..f3079a2 100644
  		if p.result.Updated > 0 {
  			IncSync()
 diff --git a/kernel/model/assets.go b/kernel/model/assets.go
-index 6b1eba8..b8e4cce 100644
+index b2cf77b..fec3699 100644
 --- a/kernel/model/assets.go
 +++ b/kernel/model/assets.go
 @@ -1756,6 +1756,14 @@ func RemoveUnusedAsset(p string) (ret string, err error) {
@@ -1323,7 +1323,7 @@ index 2a3c99d..36ab1c0 100644
  		t.Fatal(err)
  	}
 diff --git a/kernel/model/block.go b/kernel/model/block.go
-index 44976fd..38d4f1a 100644
+index 8278e31..9593d23 100644
 --- a/kernel/model/block.go
 +++ b/kernel/model/block.go
 @@ -20,6 +20,7 @@ import (

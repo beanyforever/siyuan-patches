@@ -1,0 +1,342 @@
+From 5e7b08686437993d44705b734840021f32f6f4ab Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:31:29 -0400
+Subject: [PATCH] A one-page snapshot restore leaves blocks moved since in
+ their new page
+
+Restoring one page from a snapshot (RollbackRepoSnapshotFile, in patch
+0008's turn) kept every block's id. A block moved from the page to another
+page since the snapshot was then in both pages under one id: two rows in
+the block record and two in SQL, reads by id naming the page it moved to,
+and an edit by id saved there while the restored page kept the old text,
+with nothing to heal it. A restore from history avoids this: it gives a
+block the block record holds in another page a new id (SiYuan issue 14358).
+
+In its turn, before it writes the page, the restore now gives a block of
+the restored copy a new id when the block record places that id under
+another page, by root id. The block stays in the page it moved to, with its
+references, and the restored page holds the snapshot's copy as a block of
+its own. A moved block's children, such as a list's items, are blocks too,
+and every block gets its new id through treenode.ResetNodeID, as in the
+history restore. The page block keeps its id, and so do the restored page's
+own blocks and the blocks the block record doesn't hold, such as one
+deleted since.
+
+It compares pages, not notebooks, unlike the history restore's check, which
+also renews the blocks of the page itself when the page now sits in another
+notebook. So a page moved to another notebook since the snapshot restores
+as before, and the history restore doesn't change.
+
+The test, TestOnePageSnapshotRestoreLeavesBlocksMovedSinceInTheirNewPage in
+restore_moved_blocks_fts5_test.go, through what SiYuan serves: two pages,
+"Kitchen renovation" and "Sam"; a snapshot; a paragraph and a list with an
+item moved from the first page to the second and another paragraph deleted,
+as the editor sends them; then a restore of the first page. It checks that
+the block record and SQL each hold one row for each moved id, under Sam's
+page; that the restored page holds the snapshot's text under new ids, and
+its own paragraph and the deleted one under their ids; and that an edit by
+the moved paragraph's id changes Sam's page only. On v3.8.7 with patches
+0001 to 0008 it fails: each moved id has a row in the block record and in
+SQL under each page, and the restored page holds the moved blocks under
+their old ids.
+
+Checks run on the series: the test, TestSearchLeavesBlocksWhole and the
+restore tests (TestRollback.*, .*SnapshotRestore.*, .*HistoryRestore.*)
+pass with -count=1, 42 tests and subtests, and one skips as before, a gap the
+official build has, recorded on polka-siyuan's #43; SiYuan's whole kernel
+suite passes on the source, 35 packages; the image builds, applying 0001
+to 0009, and runs every patch's tests.
+---
+ kernel/model/repository.go                    |  26 ++
+ .../model/restore_moved_blocks_fts5_test.go   | 235 ++++++++++++++++++
+ 2 files changed, 261 insertions(+)
+ create mode 100644 kernel/model/restore_moved_blocks_fts5_test.go
+
+diff --git a/kernel/model/repository.go b/kernel/model/repository.go
+index 0eb5f41..ce4261f 100644
+--- a/kernel/model/repository.go
++++ b/kernel/model/repository.go
+@@ -518,6 +518,31 @@ func noteSnapshotRestoreTarget(repoPath string) (what string, changedSince func(
+ 	return "file", func() bool { return false }
+ }
+ 
++// resetIDsOfBlocksInOtherPages gives a block of a page's restored copy a new id when the block record places that id
++// under another page, as for a block moved there since the snapshot, so that the block stays in that page alone and the
++// restored page holds the snapshot's copy of it as a block of its own. The page block keeps its id, and so do the
++// restored page's own blocks and the blocks the block record doesn't hold. It compares pages by root id, not notebook,
++// so a page moved to another notebook since restores as before; a restore from history renews the ids of a page in
++// another notebook too (https://github.com/siyuan-note/siyuan/issues/14358).
++func resetIDsOfBlocksInOtherPages(tree *parse.Tree) {
++	nodes := map[string]*ast.Node{}
++	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
++		if entering && n.IsBlock() && ast.NodeDocument != n.Type {
++			nodes[n.ID] = n
++		}
++		return ast.WalkContinue
++	})
++	ids := make([]string, 0, len(nodes))
++	for id := range nodes {
++		ids = append(ids, id)
++	}
++	for id, bt := range treenode.GetBlockTrees(ids) {
++		if nil != bt && tree.Root.ID != bt.RootID {
++			treenode.ResetNodeID(nodes[id])
++		}
++	}
++}
++
+ // rollbackRepoSnapshotDocInTurn replaces page rootID with its snapshot copy, already written to from, and gives the
+ // page as written. Its caller has the turn.
+ func rollbackRepoSnapshotDocInTurn(boxID, rootID, repoPath, from string, needResetTree bool) (tree *parse.Tree, err error) {
+@@ -545,6 +570,7 @@ func rollbackRepoSnapshotDocInTurn(boxID, rootID, repoPath, from string, needRes
+ 	if needResetTree {
+ 		resetTree(tree, "", true)
+ 	}
++	resetIDsOfBlocksInOtherPages(tree)
+ 
+ 	if nil != testHookRollbackRepoSnapshotFileRead {
+ 		testHookRollbackRepoSnapshotFileRead()
+diff --git a/kernel/model/restore_moved_blocks_fts5_test.go b/kernel/model/restore_moved_blocks_fts5_test.go
+new file mode 100644
+index 0000000..d9b4103
+--- /dev/null
++++ b/kernel/model/restore_moved_blocks_fts5_test.go
+@@ -0,0 +1,235 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++//go:build fts5
++
++package model
++
++import (
++	"bytes"
++	"fmt"
++	"path/filepath"
++	"slices"
++	"testing"
++
++	"github.com/88250/lute/ast"
++	"github.com/88250/lute/parse"
++	"github.com/siyuan-note/siyuan/kernel/conf"
++	"github.com/siyuan-note/siyuan/kernel/filesys"
++	"github.com/siyuan-note/siyuan/kernel/sql"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++const (
++	movedKitchenID  = "20261019100000-kitchen" // "Kitchen renovation", the page restored
++	movedSamID      = "20261019100000-sampage" // "Sam", the page its blocks move to after the snapshot
++	movedSinkID     = "20261019100000-sink001" // a paragraph moved to Sam's page
++	movedListID     = "20261019100000-list001" // a list moved to Sam's page, with its item and the item's paragraph
++	movedItemID     = "20261019100000-item001"
++	movedItemParaID = "20261019100000-itemp01"
++	movedKeptID     = "20261019100000-kept001" // a paragraph that stays in Kitchen renovation
++	movedGoneID     = "20261019100000-gone001" // a paragraph deleted from Kitchen renovation
++	movedSamParaID  = "20261019100000-samp001" // Sam's own paragraph
++
++	movedSinkText = "Ask Sam about the sink."
++	movedTapsText = "Taps"
++)
++
++func movedTestNodeID(n *ast.Node) string {
++	if nil == n {
++		return "none"
++	}
++	return n.ID
++}
++
++func movedTestParagraph(id, text string) *ast.Node {
++	paragraph := treenode.NewParagraph(id)
++	paragraph.AppendChild(&ast.Node{Type: ast.NodeText, Tokens: []byte(text)})
++	return paragraph
++}
++
++// writeMovedTestPage writes a page holding blocks and indexes it in the block record and SQL.
++func writeMovedTestPage(t *testing.T, boxID, id, title string, blocks ...*ast.Node) {
++	t.Helper()
++	tree := treenode.NewTree(boxID, "/"+id+".sy", "/"+title, title)
++	tree.Root.FirstChild.Unlink() // the empty paragraph a new page starts with
++	for _, block := range blocks {
++		tree.Root.AppendChild(block)
++	}
++	if _, err := filesys.WriteTree(tree); nil != err {
++		t.Fatal(err)
++	}
++	treenode.UpsertBlockTree(tree)
++	sql.IndexTreeQueue(tree)
++}
++
++// snapshotMovedTestPage takes a snapshot of the workspace and returns the id of the page's file in it.
++func snapshotMovedTestPage(t *testing.T, boxID, pageID string) (fileID string) {
++	t.Helper()
++	originalRepoDir := util.RepoDir
++	util.RepoDir = filepath.Join(util.WorkspaceDir, "repo")
++	t.Cleanup(func() { util.RepoDir = originalRepoDir })
++	Conf.Repo.Store(&conf.Repo{Key: bytes.Repeat([]byte{7}, 32)}) // snapshots need the repository's key
++	Conf.System.Store(&conf.System{ID: "20261019100000-device1", Name: "test", OS: "linux"})
++	originalStatusBar := util.StatusBarCfg.Load()
++	util.StatusBarCfg.Store(util.NewStatusBar(false))
++	t.Cleanup(func() { util.StatusBarCfg.Store(originalStatusBar) })
++
++	snapshotID, err := IndexRepo("before the blocks moved")
++	if nil != err {
++		t.Fatalf("take a snapshot failed: %v", err)
++	}
++	repo, err := newRepository()
++	if nil != err {
++		t.Fatal(err)
++	}
++	index, err := repo.GetIndex(snapshotID)
++	if nil != err {
++		t.Fatal(err)
++	}
++	for _, id := range index.Files {
++		file, getErr := repo.GetFile(id)
++		if nil != getErr {
++			t.Fatal(getErr)
++		}
++		if "/"+boxID+"/"+pageID+".sy" == file.Path {
++			fileID = id
++		}
++	}
++	if "" == fileID {
++		t.Fatalf("setup: the snapshot holds no page %s", pageID)
++	}
++	return
++}
++
++func performMovedTestTx(t *testing.T, what string, op *Operation) {
++	t.Helper()
++	if err := PerformTxSync(&Transaction{DoOperations: []*Operation{op}}); nil != err {
++		t.Fatalf("%s failed: %v", what, err)
++	}
++	sql.FlushQueue()
++}
++
++// loadMovedTestPage reads a page from its file and returns it with its blocks by id.
++func loadMovedTestPage(t *testing.T, boxID, pageID string) (tree *parse.Tree, blocks map[string]*ast.Node) {
++	t.Helper()
++	tree, err := filesys.LoadTree(boxID, "/"+pageID+".sy", util.NewLute())
++	if nil != err {
++		t.Fatalf("read page %s failed: %v", pageID, err)
++	}
++	blocks = map[string]*ast.Node{}
++	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
++		if entering && n.IsBlock() {
++			blocks[n.ID] = n
++		}
++		return ast.WalkContinue
++	})
++	return
++}
++
++// Restoring one page from a snapshot leaves the blocks moved from it to another page since only in that page, and
++// gives the restored page the snapshot's copy of them under new ids. On SiYuan v3.8.7 the restore kept every block's
++// id, so a moved paragraph was then in both pages under one id: two rows in the block record and two in SQL, reads by
++// id naming the other page, and an edit by id saved there while the restored page kept the old text. The restored
++// page's own blocks, and a paragraph deleted from it since, keep their ids, as a restore from history does.
++func TestOnePageSnapshotRestoreLeavesBlocksMovedSinceInTheirNewPage(t *testing.T) {
++	boxID, _ := setupRestoreCacheTest(t)
++	list := &ast.Node{Type: ast.NodeList, ID: movedListID, ListData: &ast.ListData{Typ: 1}}
++	list.SetIALAttr("id", movedListID)
++	item := &ast.Node{Type: ast.NodeListItem, ID: movedItemID, ListData: &ast.ListData{Typ: 1}}
++	item.SetIALAttr("id", movedItemID)
++	item.AppendChild(movedTestParagraph(movedItemParaID, movedTapsText))
++	list.AppendChild(item)
++	writeMovedTestPage(t, boxID, movedKitchenID, "Kitchen renovation", movedTestParagraph(movedKeptID, "Measure the window."),
++		movedTestParagraph(movedSinkID, movedSinkText), list, movedTestParagraph(movedGoneID, "Buy tiles."))
++	writeMovedTestPage(t, boxID, movedSamID, "Sam", movedTestParagraph(movedSamParaID, "Sam's number."))
++	sql.FlushQueue()
++	fileID := snapshotMovedTestPage(t, boxID, movedKitchenID)
++
++	// As the editor sends them: the paragraph and the list dragged into Sam's page, and a paragraph deleted.
++	performMovedTestTx(t, "setup: moving the paragraph", &Operation{Action: "move", ID: movedSinkID, ParentID: movedSamID, PreviousID: movedSamParaID})
++	performMovedTestTx(t, "setup: moving the list", &Operation{Action: "move", ID: movedListID, ParentID: movedSamID, PreviousID: movedSinkID})
++	performMovedTestTx(t, "setup: deleting a paragraph", &Operation{Action: "delete", ID: movedGoneID})
++
++	if err := RollbackRepoSnapshotFile(fileID); nil != err {
++		t.Fatalf("roll the page back to the snapshot failed: %v", err)
++	}
++	sql.FlushQueue()
++
++	moved := []string{movedSinkID, movedListID, movedItemID, movedItemParaID}
++	for _, bt := range treenode.GetBlockTreesByRootID(movedKitchenID) {
++		if slices.Contains(moved, bt.ID) {
++			t.Errorf("the block record places moved block %s in the restored page too", bt.ID)
++		}
++	}
++	for _, id := range moved {
++		if bt := treenode.GetBlockTree(id); nil == bt || movedSamID != bt.RootID {
++			t.Errorf("the block record doesn't place moved block %s in Sam's page: %+v", id, bt)
++		}
++		rows, err := sql.QueryNoLimit("SELECT root_id FROM blocks WHERE id = '" + id + "'")
++		if nil != err || 1 != len(rows) || movedSamID != rows[0]["root_id"] {
++			t.Errorf("SQL holds %v for moved block %s, not one row under Sam's page (%v)", rows, id, err)
++		}
++	}
++
++	kitchen, blocks := loadMovedTestPage(t, boxID, movedKitchenID)
++	if movedKitchenID != kitchen.ID {
++		t.Errorf("the restored page's id is %s, not %s", kitchen.ID, movedKitchenID)
++	}
++	for _, id := range moved {
++		if nil != blocks[id] {
++			t.Errorf("the restored page holds moved block %s under its old id", id)
++		}
++	}
++	for id, text := range map[string]string{movedKeptID: "Measure the window.", movedGoneID: "Buy tiles."} {
++		if nil == blocks[id] || text != blocks[id].Text() {
++			t.Errorf("the restored page doesn't hold %q under its own id %s", text, id)
++		}
++	}
++	copies := map[string]*ast.Node{}
++	for _, b := range blocks {
++		if ast.NodeParagraph == b.Type {
++			copies[b.Text()] = b
++		}
++	}
++	if sink := copies[movedSinkText]; nil == sink || slices.Contains(moved, sink.ID) {
++		t.Errorf("the restored page doesn't hold the snapshot's %q under a new id: %s", movedSinkText, movedTestNodeID(sink))
++	}
++	if taps := copies[movedTapsText]; nil == taps || ast.NodeListItem != taps.Parent.Type || ast.NodeList != taps.Parent.Parent.Type ||
++		slices.Contains(moved, taps.ID) || slices.Contains(moved, taps.Parent.ID) || slices.Contains(moved, taps.Parent.Parent.ID) {
++		t.Errorf("the restored page doesn't hold the snapshot's list under new ids: its paragraph is %s", movedTestNodeID(taps))
++	}
++
++	// An edit by the moved paragraph's id changes Sam's page only.
++	edited := "Ask Sam about the sink and the taps."
++	performMovedTestTx(t, "editing the moved paragraph", &Operation{Action: "update", ID: movedSinkID,
++		Data: fmt.Sprintf(`<div data-node-id="%s" data-type="NodeParagraph"><div contenteditable="true">%s</div></div>`, movedSinkID, edited)})
++	if _, sam := loadMovedTestPage(t, boxID, movedSamID); nil == sam[movedSinkID] || edited != sam[movedSinkID].Text() {
++		t.Errorf("the edit by id didn't reach the paragraph in Sam's page: %s", movedTestNodeID(sam[movedSinkID]))
++	}
++	_, blocks = loadMovedTestPage(t, boxID, movedKitchenID)
++	kept := false
++	for _, b := range blocks {
++		if edited == b.Text() {
++			t.Errorf("the edit by the moved paragraph's id changed the restored page's block %s", b.ID)
++		}
++		kept = kept || (ast.NodeParagraph == b.Type && movedSinkText == b.Text())
++	}
++	if !kept {
++		t.Errorf("after the edit, the restored page no longer holds the snapshot's %q", movedSinkText)
++	}
++}
+-- 
+2.53.0
+

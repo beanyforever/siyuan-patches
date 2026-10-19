@@ -1,4 +1,4 @@
-From 3004076eda24f28051d50772da87860fa67deebf Mon Sep 17 00:00:00 2001
+From aa25645e8f587efbb9d0771d1d9f07f97d4eac07 Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 14:30:33 -0400
 Subject: [PATCH] MCP server sends the custom instructions as its instructions

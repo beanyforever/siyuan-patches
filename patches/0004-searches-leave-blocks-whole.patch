@@ -1,4 +1,4 @@
-From 3005c28060d10c61aee2ca4ee9a5615554df0459 Mon Sep 17 00:00:00 2001
+From 956920434413fbd972553dfbf9054df5469b75da Mon Sep 17 00:00:00 2001
 From: Beany <24502088+beanyforever@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 09:40:23 -0400
 Subject: [PATCH] A search leaves the blocks it finds reading whole
@@ -20,35 +20,217 @@ The two routes those searches use, SelectBlocksRawStmtArgsInBox and
 SelectBlocksRawStmtNoParseInBox, get NoCache twins that scan rows without
 storing them, through scanBlockRowsNoCache, and the three searches use
 them. Results are built from the rows returned, so nothing they show
-changes. Every other read of blocks caches as before; the default keyword
-search with paths, and multi-word searches, already read rows as maps.
+changes. The default keyword search with paths, and multi-word searches,
+already read rows as maps.
+
+A statement written outside SiYuan's code can select the same in place of
+a block's fields, so every route that runs one reads its rows that way
+too: an embed block's query, wherever SiYuan runs it (the editor's embed
+search, the embed content it indexes and publishes, rendering, exports, a
+page's statistics, and the assets of embedded blocks), the full-text
+search's SQL method, and templates' queryBlocks. The route decides, not
+the statement: SelectBlocksRawStmt, SelectBlocksRawStmtInBox,
+SelectBlocksRawStmtInBoxContext, SelectBlocksRawStmtBoundedInBoxContext
+and SelectBlocksRawStmtNoParse get NoCache twins, each pair sharing one
+body; and searchBySQLInBoxContext takes its select from its caller, so
+SiYuan's own lookups by id keep caching. What each route shows doesn't
+change, and every read of blocks by a statement SiYuan builds caches as
+before.
 
 Its Go test is TestSearchLeavesBlocksWhole, in search_cache_fts5_test.go,
 on a page holding a paragraph of 7,896 characters named "needle list": a
 keyword search without paths, a query-syntax search, a block-ref search,
-and opening the page with the query needle, then GetBlock of the page and
-the paragraph. Without the patch, on v3.8.7 with 0001 to 0008 applied, the
-first two left the paragraph 515 characters long and the block-ref search
-67, all three with search marks in its name, and opening the page left the
-marks; without any one of the three changes, its own case fails.
+and opening the page with the query needle; then an embed block query and
+an SQL-method search whose statements select snippet() in place of
+content, and two template queries selecting highlight() and snippet() in
+its place, each checking it shows what it did before; then GetBlock of the
+page and the paragraph. Without the patch, on v3.8.7 with 0001 to 0008
+applied, the first two left the paragraph 515 characters long and the
+block-ref search 67, all three with search marks in its name, and opening
+the page left the marks; without the routes for statements written outside
+SiYuan's code, the embed block query, the SQL-method search and the
+template query selecting snippet() left it 18 characters long and the one
+selecting highlight() left it marked up. Without any one of the three
+searches' changes, or the embed search's, the SQL method's or
+queryBlocks', only its own cases fail; the other routes of embed blocks
+have no case of their own.
 
 Still open: SQL's block cache changes before the SQL commit, so a read in
-that moment can cache the old row; and a search by SQL, or an embed block,
-whose own statement selects snippet() or highlight() in place of a block's
-fields still caches what it reads.
+that moment can cache the old row.
 ---
- kernel/model/search.go                 |   9 +-
- kernel/model/search_cache_fts5_test.go | 163 +++++++++++++++++++++++++
- kernel/sql/block_query.go              |  11 +-
- kernel/sql/encrypted_query.go          |  24 +++-
- 4 files changed, 201 insertions(+), 6 deletions(-)
+ kernel/model/asset_download_read.go    |   5 +-
+ kernel/model/assets.go                 |   3 +-
+ kernel/model/block.go                  |   3 +-
+ kernel/model/document_stat.go          |   7 +-
+ kernel/model/export.go                 |   5 +-
+ kernel/model/render.go                 |   8 +-
+ kernel/model/search.go                 |  26 +--
+ kernel/model/search_cache_fts5_test.go | 211 +++++++++++++++++++++++++
+ kernel/sql/block_query.go              |  38 ++++-
+ kernel/sql/database.go                 |   5 +-
+ kernel/sql/embed_content.go            |   5 +-
+ kernel/sql/encrypted_query.go          |  63 +++++++-
+ 12 files changed, 341 insertions(+), 38 deletions(-)
  create mode 100644 kernel/model/search_cache_fts5_test.go
 
+diff --git a/kernel/model/asset_download_read.go b/kernel/model/asset_download_read.go
+index 8a318b6..7f86185 100644
+--- a/kernel/model/asset_download_read.go
++++ b/kernel/model/asset_download_read.go
+@@ -242,10 +242,11 @@ func prepareExportAssetsInScope(boxID string, docPaths []string, includeFootnote
+ 			}
+ 			stmt := strings.ReplaceAll(html.UnescapeString(node.TokensStr()), editor.IALValEscNewLine, "\n")
+ 			var blocks []*sql.Block
++			// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
+ 			if IsEncryptedBox(tree.Box) {
+-				blocks = sql.SelectBlocksRawStmtInBox(stmt, 1, confSearchSnapshot.Limit, tree.Box)
++				blocks = sql.SelectBlocksRawStmtInBoxNoCache(stmt, 1, confSearchSnapshot.Limit, tree.Box)
+ 			} else {
+-				blocks = sql.SelectBlocksRawStmt(stmt, 1, confSearchSnapshot.Limit)
++				blocks = sql.SelectBlocksRawStmtNoCache(stmt, 1, confSearchSnapshot.Limit)
+ 			}
+ 			for _, block := range blocks {
+ 				if embedded, loadErr := loadExportRelatedTree(block.ID, tree.Box); loadErr == nil {
+diff --git a/kernel/model/assets.go b/kernel/model/assets.go
+index 044b519..d39e192 100644
+--- a/kernel/model/assets.go
++++ b/kernel/model/assets.go
+@@ -2590,7 +2590,8 @@ func getQueryEmbedNodesAssetsLinkDests(node *ast.Node) (ret []string) {
+ 		stmt := n.TokensStr()
+ 		stmt = html.UnescapeString(stmt)
+ 		stmt = strings.ReplaceAll(stmt, editor.IALValEscNewLine, "\n")
+-		sqlBlocks := sql.SelectBlocksRawStmt(stmt, 1, Conf.Search.Load().Limit)
++		// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
++		sqlBlocks := sql.SelectBlocksRawStmtNoCache(stmt, 1, Conf.Search.Load().Limit)
+ 		for _, sqlBlock := range sqlBlocks {
+ 			subtree, _ := LoadTreeByBlockID(sqlBlock.ID)
+ 			if nil == subtree {
+diff --git a/kernel/model/block.go b/kernel/model/block.go
+index 44976fd..8278e31 100644
+--- a/kernel/model/block.go
++++ b/kernel/model/block.go
+@@ -1363,7 +1363,8 @@ func resolveEmbedContentInBox(n *ast.Node, luteEngine *lute.Lute, boxID string,
+ 		stmt = strings.ReplaceAll(stmt, editor.IALValEscNewLine, "\n")
+ 
+ 		// 执行查询获取嵌入的块
+-		sqlBlocks := sql.SelectBlocksRawStmtInBox(stmt, 1, Conf.Search.Load().Limit, boxID)
++		// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
++		sqlBlocks := sql.SelectBlocksRawStmtInBoxNoCache(stmt, 1, Conf.Search.Load().Limit, boxID)
+ 		sqlBlocks = filterEmbedBlocksByAccess(sqlBlocks, accessChecker)
+ 
+ 		// 收集所有嵌入块的内容 HTML
+diff --git a/kernel/model/document_stat.go b/kernel/model/document_stat.go
+index 2973001..0cc4544 100644
+--- a/kernel/model/document_stat.go
++++ b/kernel/model/document_stat.go
+@@ -109,9 +109,10 @@ func GetDocumentStat(ctx context.Context, id, boxID string, includeEmbed bool, a
+ 		path:          map[string]bool{},
+ 		stat:          ret.StatWithEmbed,
+ 		info:          ret.EmbedStat,
+-		queryBlocks:   sql.SelectBlocksRawStmtBoundedInBoxContext,
+-		loadTree:      loadDocumentStatResultTree,
+-		validate:      validateDocumentStatQuery,
++		// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
++		queryBlocks: sql.SelectBlocksRawStmtBoundedInBoxContextNoCache,
++		loadTree:    loadDocumentStatResultTree,
++		validate:    validateDocumentStatQuery,
+ 	}
+ 	resolver.resolveNodes(tree, []*ast.Node{tree.Root}, 0)
+ 	return
+diff --git a/kernel/model/export.go b/kernel/model/export.go
+index 6e5292f..4765f21 100644
+--- a/kernel/model/export.go
++++ b/kernel/model/export.go
+@@ -4247,10 +4247,11 @@ func resolveFootnotesDefs(refFootnoteOrder *[]string, refFootnotesByID map[strin
+ 					stmt = html.UnescapeString(stmt)
+ 					stmt = strings.ReplaceAll(stmt, editor.IALValEscNewLine, "\n")
+ 					var sqlBlocks []*sql.Block
++					// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
+ 					if IsEncryptedBox(currentTree.Box) {
+-						sqlBlocks = sql.SelectBlocksRawStmtInBox(stmt, 1, confSearchSnapshot.Limit, currentTree.Box)
++						sqlBlocks = sql.SelectBlocksRawStmtInBoxNoCache(stmt, 1, confSearchSnapshot.Limit, currentTree.Box)
+ 					} else {
+-						sqlBlocks = sql.SelectBlocksRawStmt(stmt, 1, confSearchSnapshot.Limit)
++						sqlBlocks = sql.SelectBlocksRawStmtNoCache(stmt, 1, confSearchSnapshot.Limit)
+ 					}
+ 					for _, b := range sqlBlocks {
+ 						subNodes := renderBlockMarkdownR(b.ID, &rendered, currentTree.Box)
+diff --git a/kernel/model/render.go b/kernel/model/render.go
+index 1eaa13e..8f8b046 100644
+--- a/kernel/model/render.go
++++ b/kernel/model/render.go
+@@ -343,7 +343,8 @@ func resolveEmbedR(n *ast.Node, blockEmbedMode int, luteEngine *lute.Lute, resol
+ 			stmt := n.ChildByType(ast.NodeBlockQueryEmbedScript).TokensStr()
+ 			stmt = html.UnescapeString(stmt)
+ 			stmt = strings.ReplaceAll(stmt, editor.IALValEscNewLine, "\n")
+-			sqlBlocks := sql.SelectBlocksRawStmt(stmt, 1, Conf.Search.Load().Limit)
++			// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
++			sqlBlocks := sql.SelectBlocksRawStmtNoCache(stmt, 1, Conf.Search.Load().Limit)
+ 			var embedAccessChecker EmbedBlockAccessChecker
+ 			if 0 < len(accessChecker) {
+ 				embedAccessChecker = accessChecker[0]
+@@ -568,10 +569,11 @@ func renderBlockMarkdownR(id string, rendered *[]string, boxIDs ...string) (ret
+ 				stmt = html.UnescapeString(stmt)
+ 				stmt = strings.ReplaceAll(stmt, editor.IALValEscNewLine, "\n")
+ 				var sqlBlocks []*sql.Block
++				// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
+ 				if boxID != "" && IsEncryptedBox(boxID) {
+-					sqlBlocks = sql.SelectBlocksRawStmtInBox(stmt, 1, confSearchSnapshot.Limit, boxID)
++					sqlBlocks = sql.SelectBlocksRawStmtInBoxNoCache(stmt, 1, confSearchSnapshot.Limit, boxID)
+ 				} else {
+-					sqlBlocks = sql.SelectBlocksRawStmt(stmt, 1, confSearchSnapshot.Limit)
++					sqlBlocks = sql.SelectBlocksRawStmtNoCache(stmt, 1, confSearchSnapshot.Limit)
+ 				}
+ 				for _, sqlBlock := range sqlBlocks {
+ 					subNodes := renderBlockMarkdownR(sqlBlock.ID, rendered, boxID)
 diff --git a/kernel/model/search.go b/kernel/model/search.go
-index c38604b..4de7486 100644
+index c38604b..75c6346 100644
 --- a/kernel/model/search.go
 +++ b/kernel/model/search.go
-@@ -2382,7 +2382,8 @@ func fullTextSearchRefBlockInBox(keyword string, beforeLen int, onlyDoc bool, bo
+@@ -339,10 +339,11 @@ func searchEmbedBlockInBox(embedBlockID, stmt string, excludeIDs []string, headi
+ 	confSearchSnapshot := Conf.LoadSearch()
+ 
+ 	var sqlBlocks []*sql.Block
++	// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
+ 	if "" != boxID {
+-		sqlBlocks = sql.SelectBlocksRawStmtNoParseInBox(stmt, confSearchSnapshot.Limit, boxID)
++		sqlBlocks = sql.SelectBlocksRawStmtNoParseInBoxNoCache(stmt, confSearchSnapshot.Limit, boxID)
+ 	} else {
+-		sqlBlocks = sql.SelectBlocksRawStmtNoParse(stmt, confSearchSnapshot.Limit)
++		sqlBlocks = sql.SelectBlocksRawStmtNoParseNoCache(stmt, confSearchSnapshot.Limit)
+ 	}
+ 	ret = buildEmbedBlock(embedBlockID, excludeIDs, headingMode, breadcrumb, treenode.GetEmbedBlockRefID(stmt), sqlBlocks, updateIndex, boxID)
+ 	return
+@@ -1730,7 +1731,8 @@ func FullTextSearchBlock(options BlockSearchOptions) (ret []*Block, matchedBlock
+ 			blocks, matchedBlockCount, matchedRootCount = fullTextSearchByFTSInBox(query, boxFilter, pathFilter, boxArgs, pathArgs, typeFilter, ignoreFilter, orderByClause, beforeLen, page, pageSize, boxID)
+ 		}
+ 	case 2: // SQL
+-		blocks, matchedBlockCount, matchedRootCount = searchBySQLInBoxContext(ctx, query, beforeLen, page, pageSize, boxID)
++		// The SQL method runs a statement written outside SiYuan's code, so its rows go into no cache.
++		blocks, matchedBlockCount, matchedRootCount = searchBySQLInBoxContext(ctx, query, beforeLen, page, pageSize, boxID, sql.SelectBlocksRawStmtInBoxContextNoCache)
+ 		if ctx.Err() != nil {
+ 			return
+ 		}
+@@ -2252,12 +2254,15 @@ func isTreeExcludedByPublishAccess(tree *parse.Tree, excludeDocIDs []string) boo
+ 
+ // searchBySQLInBox 按 boxID 选择加密或全局数据库，执行分页查询并统计匹配数量。
+ func searchBySQLInBox(stmt string, beforeLen, page, pageSize int, boxID string) (ret []*Block, matchedBlockCount, matchedRootCount int) {
+-	return searchBySQLInBoxContext(context.Background(), stmt, beforeLen, page, pageSize, boxID)
++	return searchBySQLInBoxContext(context.Background(), stmt, beforeLen, page, pageSize, boxID, sql.SelectBlocksRawStmtInBoxContext)
+ }
+ 
+-func searchBySQLInBoxContext(ctx context.Context, stmt string, beforeLen, page, pageSize int, boxID string) (ret []*Block, matchedBlockCount, matchedRootCount int) {
++// searchBySQLInBoxContext reads the statement's rows with selectBlocks: the caching read for SiYuan's own statements,
++// the no-cache one for a statement written outside SiYuan's code.
++func searchBySQLInBoxContext(ctx context.Context, stmt string, beforeLen, page, pageSize int, boxID string,
++	selectBlocks func(context.Context, string, int, int, string) ([]*sql.Block, error)) (ret []*Block, matchedBlockCount, matchedRootCount int) {
+ 	stmt = strings.TrimSpace(stmt)
+-	blocks, err := sql.SelectBlocksRawStmtInBoxContext(ctx, stmt, page, pageSize, boxID)
++	blocks, err := selectBlocks(ctx, stmt, page, pageSize, boxID)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -2382,7 +2387,8 @@ func fullTextSearchRefBlockInBox(keyword string, beforeLen int, onlyDoc bool, bo
               ELSE 65535 END ASC, sort ASC, length ASC`
  	orderBy = strings.ReplaceAll(orderBy, "${keyword}", strings.ReplaceAll(keyword, "'", "''"))
  	stmt += orderBy + " LIMIT " + strconv.Itoa(confSearchSnapshot.Limit)
@@ -58,7 +240,7 @@ index c38604b..4de7486 100644
  	ret = fromSQLBlocks(&blocks, "", beforeLen)
  	if 1 > len(ret) {
  		ret = []*Block{}
-@@ -2510,7 +2511,8 @@ func fullTextSearchByFTSInBox(query, boxFilter, pathFilter string, boxArgs, path
+@@ -2510,7 +2516,8 @@ func fullTextSearchByFTSInBox(query, boxFilter, pathFilter string, boxArgs, path
  	args := []any{columnFilter() + ":(" + query + ")"}
  	args = append(args, boxArgs...)
  	args = append(args, pathArgs...)
@@ -68,7 +250,7 @@ index c38604b..4de7486 100644
  	ret = fromSQLBlocks(&blocks, "", beforeLen)
  	if 1 > len(ret) {
  		ret = []*Block{}
-@@ -2965,7 +2967,8 @@ func highlightByFTSInBox(query, typeFilter, id, boxID string) (ret []string) {
+@@ -2965,7 +2972,8 @@ func highlightByFTSInBox(query, typeFilter, id, boxID string) (ret []string) {
  	stmt += " AND root_id = '" + id + "'"
  	stmt += " LIMIT " + strconv.Itoa(limit)
  	// MATCH 操作数通过绑定参数传递，避免 SQL 拼接注入
@@ -80,10 +262,10 @@ index c38604b..4de7486 100644
  		if 0 < len(keyword) {
 diff --git a/kernel/model/search_cache_fts5_test.go b/kernel/model/search_cache_fts5_test.go
 new file mode 100644
-index 0000000..dbc83ff
+index 0000000..aec7b80
 --- /dev/null
 +++ b/kernel/model/search_cache_fts5_test.go
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,211 @@
 +// SiYuan - From thought to insight, with agents
 +// Copyright (c) 2020-present, b3log.org
 +//
@@ -193,7 +375,7 @@ index 0000000..dbc83ff
 +		}
 +	}
 +	if b := sql.GetBlock(searchCacheParagraphID); nil != b && paragraph != b.Content {
-+		t.Errorf("after %s, GetBlock gives the paragraph cut short, %d characters of %d, ending %q",
++		t.Errorf("after %s, GetBlock gives the paragraph not as stored, %d characters of %d, ending %q",
 +			after, len(b.Content), len(paragraph), b.Content[max(0, len(b.Content)-24):])
 +	}
 +}
@@ -242,16 +424,132 @@ index 0000000..dbc83ff
 +		}
 +		checkWholeBlocks(t, paragraph, "opening the page from a search")
 +	})
++
++	// Statements written outside SiYuan's code, as an embed block, the search panel's SQL method and a template run
++	// them, selecting a snippet or a highlight in place of a block's text. On v3.8.7 each route stored the rows it read
++	// in SQL's block cache, so the paragraph then read cut to its snippet, or marked up, wherever SiYuan reads it by id.
++	fields := func(content string) string {
++		return "SELECT id, parent_id, root_id, hash, box, path, hpath, name, alias, memo, tag, " + content +
++			" AS content, fcontent, markdown, length, type, subtype, ial, sort, created, updated FROM blocks_fts "
++	}
++	snippetMatch := fields("snippet(blocks_fts, 11, '<b>', '</b>', '...', 8)") + "WHERE blocks_fts MATCH 'needle'"
++	snippetEquals := fields("snippet(blocks_fts, 11, '<b>', '</b>', '...', 8)") + "WHERE blocks_fts = 'needle'"
++	highlight := fields("highlight(blocks_fts, 11, '<mark>', '</mark>')") + "WHERE blocks_fts MATCH 'needle'"
++	t.Run("embed block query", func(t *testing.T) {
++		_, paragraph := setupSearchCacheTest(t)
++		// As /api/search/searchEmbedBlock does for an embed block in the editor.
++		embeds := SearchEmbedBlock("", snippetMatch, nil, 0, false)
++		if !slices.ContainsFunc(embeds, func(e *EmbedBlock) bool { return isSearchCacheParagraph(e.Block) }) {
++			t.Fatalf("the embed block doesn't show the paragraph: %d results", len(embeds))
++		}
++		checkWholeBlocks(t, paragraph, "an embed block query")
++	})
++	t.Run("SQL-method search", func(t *testing.T) {
++		_, paragraph := setupSearchCacheTest(t)
++		blocks, _, _, _, _ := FullTextSearchBlock(BlockSearchOptions{Query: snippetEquals, Method: 2, Page: 1, PageSize: 10})
++		i := slices.IndexFunc(blocks, isSearchCacheParagraph)
++		if 0 > i {
++			t.Fatalf("the search didn't find the paragraph: %d results", len(blocks))
++		}
++		if found := blocks[i].Content; !strings.Contains(found, "needle") || len(paragraph) <= len(found) {
++			t.Errorf("the search shows the paragraph as %d characters, not its snippet: %q", len(found), found[:min(64, len(found))])
++		}
++		checkWholeBlocks(t, paragraph, "an SQL-method search")
++	})
++	t.Run("template query", func(t *testing.T) {
++		_, paragraph := setupSearchCacheTest(t)
++		out, err := RenderGoTemplate("{{range queryBlocks `" + highlight + "`}}[{{.ID}}: {{.Content}}]{{end}}")
++		if nil != err || !strings.Contains(out, "["+searchCacheParagraphID+": <mark>needle</mark> word0 word1") {
++			t.Fatalf("the template doesn't show the paragraph highlighted: %v, %q", err, out[:min(160, len(out))])
++		}
++		checkWholeBlocks(t, paragraph, "a template query")
++	})
++	t.Run("template snippet query", func(t *testing.T) {
++		_, paragraph := setupSearchCacheTest(t)
++		out, err := RenderGoTemplate("{{range queryBlocks `" + snippetMatch + "`}}{{if eq .ID `" + searchCacheParagraphID + "`}}{{.Content}}{{end}}{{end}}")
++		if nil != err || !strings.HasPrefix(out, "<b>needle</b>") || len(paragraph) <= len(out) {
++			t.Fatalf("the template doesn't show the paragraph's snippet: %v, %q", err, out[:min(160, len(out))])
++		}
++		checkWholeBlocks(t, paragraph, "a template snippet query")
++	})
 +}
 +
 +func isSearchCacheParagraph(b *Block) bool {
 +	return searchCacheParagraphID == b.ID
 +}
 diff --git a/kernel/sql/block_query.go b/kernel/sql/block_query.go
-index 2e23a00..aae9cca 100644
+index 2e23a00..738d300 100644
 --- a/kernel/sql/block_query.go
 +++ b/kernel/sql/block_query.go
-@@ -868,13 +868,22 @@ func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, q
+@@ -687,6 +687,12 @@ func SelectBlocksRawStmtNoParse(stmt string, limit int) (ret []*Block) {
+ 	return selectBlocksRawStmt(stmt, limit)
+ }
+ 
++// SelectBlocksRawStmtNoParseNoCache reads rows as SelectBlocksRawStmtNoParse does but stores none in SQL's block
++// cache, for a statement written outside SiYuan's code, whose rows can hold anything in place of a block's fields.
++func SelectBlocksRawStmtNoParseNoCache(stmt string, limit int) (ret []*Block) {
++	return selectBlocksRawStmtNoParseWithQuery(stmt, limit, "", query, scanBlockRowsNoCache)
++}
++
+ // SelectBlocksRawStmtArgs 与 selectBlocksRawStmt 行为一致，但通过绑定参数执行，
+ // 绕开 sqlparser 解析（vitess 会把 "?" 改写为 ":vN" 导致占位失效），用于含用户可控参数的搜索语句。
+ func SelectBlocksRawStmtArgs(stmt string, args []any, limit int) (ret []*Block) {
+@@ -725,14 +731,20 @@ func SelectBlocksRawStmtArgs(stmt string, args []any, limit int) (ret []*Block)
+ type queryRowsFunc func(string, ...any) (*sql.Rows, error)
+ 
+ func SelectBlocksRawStmt(stmt string, page, limit int) (ret []*Block) {
+-	return selectBlocksRawStmtWithQuery(stmt, page, limit, "", query)
++	return selectBlocksRawStmtWithQuery(stmt, page, limit, "", query, scanBlockRows)
++}
++
++// SelectBlocksRawStmtNoCache reads rows as SelectBlocksRawStmt does but stores none in SQL's block cache, for a
++// statement written outside SiYuan's code, whose rows can hold anything in place of a block's fields.
++func SelectBlocksRawStmtNoCache(stmt string, page, limit int) (ret []*Block) {
++	return selectBlocksRawStmtWithQuery(stmt, page, limit, "", query, scanBlockRowsNoCache)
+ }
+ 
+-func selectBlocksRawStmtWithQuery(stmt string, page, limit int, boxID string, queryFn queryRowsFunc) (ret []*Block) {
++func selectBlocksRawStmtWithQuery(stmt string, page, limit int, boxID string, queryFn queryRowsFunc, scan func(*sql.Rows) *Block) (ret []*Block) {
+ 	parsedStmt, err := sqlparser.Parse(stmt)
+ 	if err != nil {
+ 		// 解析失败时按原样执行，因此只读校验必须在执行前完成，不能依赖下面的语句类型分派
+-		return selectBlocksRawStmtNoParseWithQuery(stmt, limit, boxID, queryFn)
++		return selectBlocksRawStmtNoParseWithQuery(stmt, limit, boxID, queryFn, scan)
+ 	}
+ 
+ 	switch parsedStmt.(type) {
+@@ -824,7 +836,7 @@ func selectBlocksRawStmtWithQuery(stmt string, page, limit int, boxID string, qu
+ 	}
+ 	defer rows.Close()
+ 	for rows.Next() {
+-		if block := scanBlockRows(rows); nil != block {
++		if block := scan(rows); nil != block {
+ 			ret = append(ret, block)
+ 		}
+ 	}
+@@ -832,10 +844,10 @@ func selectBlocksRawStmtWithQuery(stmt string, page, limit int, boxID string, qu
+ }
+ 
+ func selectBlocksRawStmt(stmt string, limit int) (ret []*Block) {
+-	return selectBlocksRawStmtNoParseWithQuery(stmt, limit, "", query)
++	return selectBlocksRawStmtNoParseWithQuery(stmt, limit, "", query, scanBlockRows)
+ }
+ 
+-func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, queryFn queryRowsFunc) (ret []*Block) {
++func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, queryFn queryRowsFunc, scan func(*sql.Rows) *Block) (ret []*Block) {
+ 	if !checkRawBlockQueryStmt(stmt, boxID) {
+ 		return
+ 	}
+@@ -853,7 +865,7 @@ func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, q
+ 	var count, errCount int
+ 	for rows.Next() {
+ 		count++
+-		if block := scanBlockRows(rows); nil != block {
++		if block := scan(rows); nil != block {
+ 			ret = append(ret, block)
+ 		} else {
+ 			logging.LogWarnf("raw sql query [%s] failed", stmt)
+@@ -868,13 +880,23 @@ func selectBlocksRawStmtNoParseWithQuery(stmt string, limit int, boxID string, q
  }
  
  func scanBlockRows(rows *sql.Rows) (ret *Block) {
@@ -261,9 +559,10 @@ index 2e23a00..aae9cca 100644
 +	return
 +}
 +
-+// scanBlockRowsNoCache scans a row as scanBlockRows does but stores nothing in SQL's block cache. A search's rows hold
-+// snippets and search marks rather than the block as stored, and GetBlock, which reads the cache first, would serve them
-+// to the backlinks panel and ref text.
++// scanBlockRowsNoCache scans a row as scanBlockRows does but stores nothing in SQL's block cache, for rows that must
++// not enter it: a search's, which hold snippets or search marks, or those of a statement written outside SiYuan's
++// code, which can hold anything in place of a block's fields. GetBlock reads the cache first, and would serve such rows
++// to the backlinks panel and ref text as the blocks as stored.
 +func scanBlockRowsNoCache(rows *sql.Rows) (ret *Block) {
  	var block Block
  	if err := rows.Scan(&block.ID, &block.ParentID, &block.RootID, &block.Hash, &block.Box, &block.Path, &block.HPath, &block.Name, &block.Alias, &block.Memo, &block.Tag, &block.Content, &block.FContent, &block.Markdown, &block.Length, &block.Type, &block.SubType, &block.IAL, &block.Sort, &block.Created, &block.Updated); err != nil {
@@ -275,11 +574,113 @@ index 2e23a00..aae9cca 100644
  	return
  }
  
+diff --git a/kernel/sql/database.go b/kernel/sql/database.go
+index 25bec3e..cf33f43 100644
+--- a/kernel/sql/database.go
++++ b/kernel/sql/database.go
+@@ -1955,10 +1955,11 @@ func SQLTemplateFuncs(templateFuncMap *template.FuncMap, boxIDs ...string) {
+ 		if !isReadonlyStmt(stmt) {
+ 			return
+ 		}
++		// A template's statement is written outside SiYuan's code, so its rows go into no cache.
+ 		if boxID == "" {
+-			retBlocks = SelectBlocksRawStmt(stmt, 1, 512)
++			retBlocks = SelectBlocksRawStmtNoCache(stmt, 1, 512)
+ 		} else {
+-			retBlocks = SelectBlocksRawStmtInBox(stmt, 1, 512, boxID)
++			retBlocks = SelectBlocksRawStmtInBoxNoCache(stmt, 1, 512, boxID)
+ 		}
+ 		return
+ 	}
+diff --git a/kernel/sql/embed_content.go b/kernel/sql/embed_content.go
+index 3c7c65c..f457cbe 100644
+--- a/kernel/sql/embed_content.go
++++ b/kernel/sql/embed_content.go
+@@ -24,10 +24,11 @@ func CalculateEmbedBlockContent(block *Block) (content string, supported bool) {
+ 		return "", false
+ 	}
+ 	var blocks []*Block
++	// An embed block's statement is written outside SiYuan's code, so its rows go into no cache.
+ 	if IsEncryptedBoxFn != nil && IsEncryptedBoxFn(block.Box) {
+-		blocks = SelectBlocksRawStmtNoParseInBox(stmt, 102400, block.Box)
++		blocks = SelectBlocksRawStmtNoParseInBoxNoCache(stmt, 102400, block.Box)
+ 	} else {
+-		blocks = SelectBlocksRawStmtNoParse(stmt, 102400)
++		blocks = SelectBlocksRawStmtNoParseNoCache(stmt, 102400)
+ 	}
+ 	for _, result := range blocks {
+ 		content += result.Content
 diff --git a/kernel/sql/encrypted_query.go b/kernel/sql/encrypted_query.go
-index ccfe0d1..77ba60d 100644
+index ccfe0d1..a84f4f4 100644
 --- a/kernel/sql/encrypted_query.go
 +++ b/kernel/sql/encrypted_query.go
-@@ -357,6 +357,16 @@ func QueryNoLimitArgsInBox(stmt, boxID string, args ...any) (ret []map[string]an
+@@ -271,23 +271,54 @@ func QueryRootChildrenRefCountInBox(defRootID, boxID string) (ret map[string]int
+ 
+ // SelectBlocksRawStmtInBox 在指定 box 的 db 里执行原始 SQL 查询 blocks。
+ func SelectBlocksRawStmtInBox(stmt string, page, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtInBox(stmt, page, limit, boxID, scanBlockRows)
++}
++
++// SelectBlocksRawStmtInBoxNoCache reads rows as SelectBlocksRawStmtInBox does but stores none in SQL's block cache,
++// for a statement written outside SiYuan's code, whose rows can hold anything in place of a block's fields.
++func SelectBlocksRawStmtInBoxNoCache(stmt string, page, limit int, boxID string) (ret []*Block) {
++	return selectBlocksRawStmtInBox(stmt, page, limit, boxID, scanBlockRowsNoCache)
++}
++
++func selectBlocksRawStmtInBox(stmt string, page, limit int, boxID string, scan func(*sql.Rows) *Block) (ret []*Block) {
+ 	queryFn := func(stmt string, args ...any) (*sql.Rows, error) {
+ 		return queryForBox(boxID, stmt, args...)
+ 	}
+-	return selectBlocksRawStmtWithQuery(stmt, page, limit, boxID, queryFn)
++	return selectBlocksRawStmtWithQuery(stmt, page, limit, boxID, queryFn, scan)
+ }
+ 
+ func SelectBlocksRawStmtInBoxContext(ctx context.Context, stmt string, page, limit int, boxID string) (ret []*Block, err error) {
++	return selectBlocksRawStmtInBoxContext(ctx, stmt, page, limit, boxID, scanBlockRows)
++}
++
++// SelectBlocksRawStmtInBoxContextNoCache reads rows as SelectBlocksRawStmtInBoxContext does but stores none in SQL's
++// block cache, for a statement written outside SiYuan's code, whose rows can hold anything in place of a block's fields.
++func SelectBlocksRawStmtInBoxContextNoCache(ctx context.Context, stmt string, page, limit int, boxID string) (ret []*Block, err error) {
++	return selectBlocksRawStmtInBoxContext(ctx, stmt, page, limit, boxID, scanBlockRowsNoCache)
++}
++
++func selectBlocksRawStmtInBoxContext(ctx context.Context, stmt string, page, limit int, boxID string, scan func(*sql.Rows) *Block) (ret []*Block, err error) {
+ 	queryFn := func(stmt string, args ...any) (*sql.Rows, error) {
+ 		return queryForBoxContext(ctx, boxID, stmt, args...)
+ 	}
+-	ret = selectBlocksRawStmtWithQuery(stmt, page, limit, boxID, queryFn)
++	ret = selectBlocksRawStmtWithQuery(stmt, page, limit, boxID, queryFn, scan)
+ 	err = ctx.Err()
+ 	return
+ }
+ 
+ // SelectBlocksRawStmtBoundedInBoxContext 执行原始块查询，并无条件限制返回行数。
+ func SelectBlocksRawStmtBoundedInBoxContext(ctx context.Context, stmt string, limit int, boxID string) (ret []*Block, truncated bool, err error) {
++	return selectBlocksRawStmtBoundedInBoxContext(ctx, stmt, limit, boxID, scanBlockRows)
++}
++
++// SelectBlocksRawStmtBoundedInBoxContextNoCache reads rows as SelectBlocksRawStmtBoundedInBoxContext does but stores
++// none in SQL's block cache, for a statement written outside SiYuan's code, whose rows can hold anything in place of a
++// block's fields.
++func SelectBlocksRawStmtBoundedInBoxContextNoCache(ctx context.Context, stmt string, limit int, boxID string) (ret []*Block, truncated bool, err error) {
++	return selectBlocksRawStmtBoundedInBoxContext(ctx, stmt, limit, boxID, scanBlockRowsNoCache)
++}
++
++func selectBlocksRawStmtBoundedInBoxContext(ctx context.Context, stmt string, limit int, boxID string, scan func(*sql.Rows) *Block) (ret []*Block, truncated bool, err error) {
+ 	if !checkRawBlockQueryStmt(stmt, boxID) {
+ 		return
+ 	}
+@@ -303,7 +334,7 @@ func SelectBlocksRawStmtBoundedInBoxContext(ctx context.Context, stmt string, li
+ 			truncated = true
+ 			break
+ 		}
+-		block := scanBlockRows(rows)
++		block := scan(rows)
+ 		if nil == block {
+ 			return nil, false, errors.New("query result columns do not match blocks")
+ 		}
+@@ -357,6 +388,17 @@ func QueryNoLimitArgsInBox(stmt, boxID string, args ...any) (ret []map[string]an
  // SelectBlocksRawStmtArgsInBox 在指定 box 的 db 里执行参数化原始 SQL 查询 blocks。
  // 与 SelectBlocksRawStmtArgs 对应，绕开 sqlparser 对 "?" 占位的改写。
  func SelectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID string) (ret []*Block) {
@@ -287,7 +688,8 @@ index ccfe0d1..77ba60d 100644
 +}
 +
 +// SelectBlocksRawStmtArgsInBoxNoCache reads rows as SelectBlocksRawStmtArgsInBox does but stores none in SQL's block
-+// cache, for a search whose rows hold snippets or search marks rather than the blocks as stored.
++// cache, for rows that must not enter it: a search's, which hold snippets or search marks, or those of a
++// statement written outside SiYuan's code, which can hold anything in place of a block's fields.
 +func SelectBlocksRawStmtArgsInBoxNoCache(stmt string, args []any, limit int, boxID string) (ret []*Block) {
 +	return selectBlocksRawStmtArgsInBox(stmt, args, limit, boxID, scanBlockRowsNoCache)
 +}
@@ -296,7 +698,7 @@ index ccfe0d1..77ba60d 100644
  	if !checkRawBlockQueryStmt(stmt, boxID) {
  		return
  	}
-@@ -375,7 +385,7 @@ func SelectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID stri
+@@ -375,7 +417,7 @@ func SelectBlocksRawStmtArgsInBox(stmt string, args []any, limit int, boxID stri
  	var count, errCount int
  	for rows.Next() {
  		count++
@@ -305,7 +707,7 @@ index ccfe0d1..77ba60d 100644
  			ret = append(ret, block)
  		} else {
  			logging.LogWarnf("raw sql query [%s] failed", stmt)
-@@ -664,6 +674,16 @@ func QueryRefIDsByDefIDInBox(defID string, containChildren bool, boxID string) (
+@@ -664,6 +706,17 @@ func QueryRefIDsByDefIDInBox(defID string, containChildren bool, boxID string) (
  
  // SelectBlocksRawStmtNoParseInBox 与 SelectBlocksRawStmtNoParse 一致，但按 boxID 路由。
  func SelectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string) (ret []*Block) {
@@ -313,7 +715,8 @@ index ccfe0d1..77ba60d 100644
 +}
 +
 +// SelectBlocksRawStmtNoParseInBoxNoCache reads rows as SelectBlocksRawStmtNoParseInBox does but stores none in SQL's
-+// block cache, for a search whose rows hold snippets or search marks rather than the blocks as stored.
++// block cache, for rows that must not enter it: a search's, which hold snippets or search marks, or those of a
++// statement written outside SiYuan's code, which can hold anything in place of a block's fields.
 +func SelectBlocksRawStmtNoParseInBoxNoCache(stmt string, limit int, boxID string) (ret []*Block) {
 +	return selectBlocksRawStmtNoParseInBox(stmt, limit, boxID, scanBlockRowsNoCache)
 +}
@@ -322,7 +725,7 @@ index ccfe0d1..77ba60d 100644
  	if !checkRawBlockQueryStmt(stmt, boxID) {
  		return
  	}
-@@ -681,7 +701,7 @@ func SelectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string) (ret
+@@ -681,7 +734,7 @@ func SelectBlocksRawStmtNoParseInBox(stmt string, limit int, boxID string) (ret
  	var count, errCount int
  	for rows.Next() {
  		count++

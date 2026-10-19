@@ -1,0 +1,189 @@
+From 7e84d91b3460ac9d1bcd2ca0e2807b76bfd07e92 Mon Sep 17 00:00:00 2001
+From: Beany <24502088+beanyforever@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:16:31 -0400
+Subject: [PATCH] A refresh of a page's info leaves the info it was queued with
+ as it was
+
+After a page is saved, SiYuan queues a refresh of the page's info for the
+page tree (refreshDocInfo0, as task.ReloadProtyle), and one for the page
+above it. The refresh's handler wrote the page's sub-page count into the
+docInfo map it was queued with. Since v3.8.7, the task queue's duplicate
+check (containTask, from appendTaskWithDelayTimeout) compares a new task
+with the running async tasks too, and areArgsEqual falls back to
+reflect.DeepEqual, which reads a running refresh's map. When a refresh was
+queued while another wrote its count, Go stopped the whole process with
+"fatal error: concurrent map iteration and map write", and whatever was
+talking to SiYuan got a cut connection (polka-siyuan's issue #49). v3.8.6
+compared only the queued tasks and the running task that wasn't async, so
+it never read a running refresh's map.
+
+The handler now writes the count into a copy of docInfo (maps.Clone) and
+pushes the copy, so a task's arguments don't change once it is queued.
+The page tree gets the same info as before. The duplicate check doesn't
+change, but it now sees a running refresh's info as it was queued: a
+refresh of identical info queued while one runs is always dropped as its
+duplicate, where before it was dropped only until the running one had
+written its count. The window that adds is the push after the count.
+
+The queue's other unique tasks with a map or slice argument only read it,
+so they don't change: UpdateIDs' block-id map, which util.PushUpdateIDs
+broadcasts after its caller has returned, and RefreshCrossTreeMoveRefs'
+list, a copy the transaction makes for it, which refreshCrossTreeMoveRefs
+reads.
+
+The test, TestDocInfoRefreshLeavesTheInfoItWasQueuedWith in
+doc_info_refresh_test.go, goes through refreshDocInfo0 and the real task
+queue (task.ExecAsyncTaskJob). util.ReloadDocInfoGuard, which SiYuan calls
+just before it pushes a page's info, holds the first push of a page last
+changed years ago, so its humanized times read the same in each refresh;
+the page is in a notebook of the test's own, so only its pushes count.
+While the push is held, the same refresh is queued again, then the queue
+runs what is due. On v3.8.7 with patches 0001 to 0009 it fails: the
+running refresh's info has gained subFileCount, so the second refresh
+isn't its duplicate and the page's info is pushed twice. With the change
+it is pushed once.
+
+Checks run on the series: the test fails without the change and passes
+with it; SiYuan's whole kernel suite passes on the source, 35 packages,
+with -count=1; the image builds, applying 0001 to 0010, and runs every
+patch's tests. Two one-off checks: under the race detector, a 5 s burst
+of identical refreshes while the queue ran them reported a race between
+the handler's write and areArgsEqual's read on 0001 to 0009, and none
+with the change; and on a throwaway of the image before and of the new
+one, a page-tree session on SiYuan's websocket got the same reloadDocInfo
+messages for a page given a sub-page, its subFileCount 0 and then 1.
+---
+ kernel/model/doc_info_refresh_test.go | 95 +++++++++++++++++++++++++++
+ kernel/model/push_reload.go           |  7 +-
+ 2 files changed, 100 insertions(+), 2 deletions(-)
+ create mode 100644 kernel/model/doc_info_refresh_test.go
+
+diff --git a/kernel/model/doc_info_refresh_test.go b/kernel/model/doc_info_refresh_test.go
+new file mode 100644
+index 0000000..36dff74
+--- /dev/null
++++ b/kernel/model/doc_info_refresh_test.go
+@@ -0,0 +1,95 @@
++// SiYuan - From thought to insight, with agents
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/siyuan-note/siyuan/kernel/task"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++// docInfoRefreshBoxID is a notebook of the test's own, so that only its page's refreshes reach the pushes it counts,
++// whatever earlier tests left in the task queue.
++const docInfoRefreshBoxID = "20200101000000-docinfo"
++
++// The task queue's duplicate check reads the arguments of the tasks running as well as those queued. A refresh of a
++// page's info that wrote the page's sub-page count into the info it was queued with changed a map that check could be
++// reading, and Go stopped SiYuan with "concurrent map iteration and map write". The refresh must leave that info as it
++// was queued: then a refresh of identical info queued while one runs is its duplicate, and the page is pushed once.
++func TestDocInfoRefreshLeavesTheInfoItWasQueuedWith(t *testing.T) {
++	setupFileOperationTest(t)
++	// A page last changed years ago, so its humanized times read the same in both refreshes.
++	tree := treenode.NewTree(docInfoRefreshBoxID, "/20200101000001-docinfo.sy", "/Doc info", "Doc info")
++	tree.Root.SetIALAttr("updated", "20200101000001")
++
++	var lock sync.Mutex
++	pushes := 0
++	held, release := make(chan struct{}), make(chan struct{})
++	finishFirstPush := sync.OnceFunc(func() { close(release) })
++	originalGuard := util.ReloadDocInfoGuard
++	// SiYuan calls the guard just before it pushes a page's info: it holds the first push of this page's info until the
++	// test lets it go.
++	util.ReloadDocInfoGuard = func(boxID string) bool {
++		if docInfoRefreshBoxID == boxID {
++			lock.Lock()
++			pushes++
++			first := 1 == pushes
++			lock.Unlock()
++			if first {
++				close(held)
++				<-release
++			}
++		}
++		return nil == originalGuard || originalGuard(boxID)
++	}
++	t.Cleanup(func() {
++		finishFirstPush()
++		util.ReloadDocInfoGuard = originalGuard
++	})
++
++	refreshDocInfo0(tree, 1)
++	runDueAsyncTasks()
++	select {
++	case <-held:
++	case <-time.After(5 * time.Second):
++		t.Fatal("the page's info wasn't pushed")
++	}
++
++	// The same refresh while the first is being pushed: the queue sees its duplicate running and drops it.
++	refreshDocInfo0(tree, 1)
++	finishFirstPush()
++	runDueAsyncTasks()
++	// A refresh queued all the same runs as soon as it is due, and reaches the guard within milliseconds. A machine slow
++	// enough to take longer could only let a build without the fix pass, never fail one with it.
++	time.Sleep(300 * time.Millisecond)
++	lock.Lock()
++	defer lock.Unlock()
++	if 1 != pushes {
++		t.Errorf("the page's info was pushed %d times, want once: the running refresh's info had changed since it was queued", pushes)
++	}
++}
++
++// runDueAsyncTasks waits out the 500 ms delay refreshDocInfo0 queues a refresh of a page's info with, then runs the
++// async tasks that are due.
++func runDueAsyncTasks() {
++	time.Sleep(600 * time.Millisecond)
++	task.ExecAsyncTaskJob()
++}
+diff --git a/kernel/model/push_reload.go b/kernel/model/push_reload.go
+index 8c412b4..dc0d0a8 100644
+--- a/kernel/model/push_reload.go
++++ b/kernel/model/push_reload.go
+@@ -18,6 +18,7 @@ package model
+ 
+ import (
+ 	"errors"
++	"maps"
+ 	"os"
+ 	"path"
+ 	"path/filepath"
+@@ -309,8 +310,10 @@ func refreshDocInfo0(tree *parse.Tree, size uint64) {
+ 				}
+ 			}
+ 		}
+-		docInfo["subFileCount"] = subFileCount
+-		util.PushReloadDocInfo(docInfo)
++		// A copy: the queue's duplicate check reads a running task's arguments, so docInfo must stay as it was queued.
++		pushed := maps.Clone(docInfo)
++		pushed["subFileCount"] = subFileCount
++		util.PushReloadDocInfo(pushed)
+ 	}, docInfo)
+ }
+ 
+-- 
+2.53.0
+
